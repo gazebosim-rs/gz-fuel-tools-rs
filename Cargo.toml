@@ -5,6 +5,12 @@ edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
 description = "Rust implementation of Gazebo Fuel tools with a compatible C++ interface"
+repository = "https://github.com/gazebosim-rs/gz-fuel-tools-rs"
+documentation = "https://docs.rs/gz-fuel-tools"
+readme = "README.md"
+keywords = ["gazebo", "fuel", "robotics", "simulation"]
+categories = ["command-line-utilities", "web-programming::http-client"]
+include = ["/Cargo.lock", "/LICENSE", "/README.md", "/CHANGELOG.md", "/RELEASING.md", "/CONTRIBUTING.md", "/SECURITY.md", "/docs/**", "/src/**", "/tests/cli.rs"]
 
 [lib]
 name = "gz_fuel_tools"
@@ -13,16 +19,17 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.149"
-serde_yaml = "0.9.34"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["serialize", "deserialize"] }
 url = "2.5.8"
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "multipart", "native-tls"] }
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.1.0", default-features = false, features = ["deflate"] }
 tempfile = "3.25"
 roxmltree = "0.20.0"
 percent-encoding = "2.3.2"
 chrono = { version = "0.4.43", default-features = false, features = ["std"] }
 
 [lints.rust]
+missing_docs = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]

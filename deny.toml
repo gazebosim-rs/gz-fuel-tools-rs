@@ -1,0 +1,30 @@
+# Checked with cargo-deny 0.20.2. Keep the complete dependency graph in scope.
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+unmaintained = "all"
+unused-ignored-advisory = "deny"
+# Exceptions must identify one advisory, its risk, and a review deadline.
+ignore = []
+
+[licenses]
+confidence-threshold = 0.95
+include-dev = true
+# These licenses cover the current graph; dual-licensed crates may use either
+# allowed alternative. New license obligations need explicit review.
+# BSD-3-Clause is also required by encoding_rs's WHATWG data license; retain
+# dependency notices when distributing compiled artifacts.
+allow = ["Apache-2.0", "BSD-3-Clause", "MIT", "Unicode-3.0", "Zlib"]
+
+[bans]
+# Transitive duplicate versions are sometimes necessary; review their warnings
+# instead of forcing unrelated upgrades. Unbounded requirements are disallowed.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+required-git-spec = "rev"

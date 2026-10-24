@@ -126,6 +126,124 @@ fn dispatch(op: &str, a: &Value) -> Value {
 }
 
 #[test]
+fn upload_metadata_is_literal_and_filenames_do_not_use_delimiters() {
+    let cache = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    let secret = cache.path().join("sentinel");
+    fs::write(&secret, "SENTINEL_MUST_NOT_BE_UPLOADED").unwrap();
+    fs::write(model.path().join("model.config"), format!(
+        "<model><name>@someone</name><description>@{}</description><sdf version='1.9'>model.sdf</sdf></model>", secret.display()
+    )).unwrap();
+    fs::write(model.path().join("model.sdf"), "<sdf/>").unwrap();
+    fs::write(model.path().join("asset;literal.txt"), "asset payload").unwrap();
+    let server = Server::new(|_| reply(200, "ok"));
+    let mut args = server.args(cache.path(), "models");
+    args["path"] = json!(model.path());
+    assert_eq!(dispatch("client.upload", &args)["result"], 8);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("@someone"));
+    assert!(requests[0].contains(&format!("@{}", secret.display())));
+    assert!(requests[0].contains("asset;literal.txt"));
+    assert!(requests[0].contains("asset payload"));
+    assert!(!requests[0].contains("SENTINEL_MUST_NOT_BE_UPLOADED"));
+}
+
+#[test]
+fn dependency_requests_scope_caller_headers_for_recursive_and_batch_downloads() {
+    let destination = Server::new(|_| (200, vec![], model_zip(None)));
+    let dependency = format!("{}/1.0/alice/models/dependency/2", destination.url);
+    let payload = model_zip(Some(&format!(
+        "model {{ file: \"model.sdf\" }} dependencies {{ uri: \"{dependency}\" }}"
+    )));
+    let source = Server::new(move |_| (200, vec![], payload.clone()));
+    for batch in [false, true] {
+        let cache = tempfile::tempdir().unwrap();
+        let mut args = source.args(cache.path(), "models");
+        args["headers"] = json!([
+            "Private-Token: source-secret",
+            "Authorization: Bearer source",
+            "X-Custom-Secret: source"
+        ]);
+        args["config"]["servers"].as_array_mut().unwrap().push(json!({
+            "url":destination.url,"version":"1.0","api_key":"destination-secret","has_authority":true
+        }));
+        if batch {
+            args["ids"] = json!([args["id"]]);
+            let results = dispatch("client.batch", &args);
+            assert_eq!(results.as_array().unwrap().len(), 2);
+            assert!(results.as_array().unwrap().iter().all(|r| r["result"] == 4));
+        } else {
+            assert_eq!(dispatch("client.download", &args)["result"], 4);
+        }
+    }
+    for request in source.requests.lock().unwrap().iter() {
+        assert!(
+            request
+                .to_lowercase()
+                .contains("private-token: source-secret")
+        );
+        assert!(request.to_lowercase().contains("x-custom-secret: source"));
+    }
+    let requests = destination.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(
+            request
+                .to_lowercase()
+                .contains("private-token: destination-secret")
+        );
+        assert!(!request.contains("source-secret"));
+        assert!(!request.to_lowercase().contains("authorization:"));
+        assert!(!request.to_lowercase().contains("x-custom-secret:"));
+    }
+}
+
+#[test]
+fn recursive_download_traverses_cached_dependencies_and_cycles() {
+    let address = Arc::new(Mutex::new(String::new()));
+    let address_handler = address.clone();
+    let server = Server::new(move |request| {
+        let url = address_handler.lock().unwrap();
+        let next = if request.contains("/models/box/") {
+            "dependency"
+        } else {
+            "box"
+        };
+        (
+            200,
+            vec![],
+            model_zip(Some(&format!(
+                "model {{ file: \"model.sdf\" }} dependencies {{ uri: \"{url}/1.0/alice/models/{next}/2\" }}"
+            ))),
+        )
+    });
+    *address.lock().unwrap() = server.url.clone();
+    let cache = tempfile::tempdir().unwrap();
+    let args = server.args(cache.path(), "models");
+    let mut seed = args.clone();
+    seed["id"]["name"] = json!("dependency");
+    let payload = model_zip(Some(&format!(
+        "model {{ file: \"model.sdf\" }} dependencies {{ uri: \"{}/1.0/alice/models/grandchild/2\" }}",
+        server.url
+    )));
+    assert_eq!(crate::io::cache_save_bytes(&seed, &payload)["ok"], true);
+    assert_eq!(dispatch("client.download", &args)["result"], 4);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/models/grandchild/"))
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.contains("/models/dependency/"))
+    );
+}
+
+#[test]
 fn url_parsing_validation_and_configuration_precedence() {
     let config = json!({"servers":[{"url":"http://host/","version":"9.0","api_key":"secret"}]});
     for kind in ["models", "worlds", "collections"] {

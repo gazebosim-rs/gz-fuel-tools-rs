@@ -6,8 +6,8 @@ never built into or linked by this library. Public C++ declarations are retained
 from upstream commit `6ac62b01d7d8af3ab23fd2239728a791704a3f09` under Apache-2.0.
 
 Final validation: all 21 C++ suites (including upstream-disabled service tests),
-47 Rust unit tests, two CLI integration tests and two coverage-checker tests pass.
-Production line coverage is **97.25% Rust** and **97.06% C++**. See the
+55 Rust unit tests, two CLI integration tests and eight validation-script tests pass.
+Production line coverage is **97.19% Rust** and **97.06% C++**. See the
 [verification report](docs/VERIFICATION.md) for evidence and scope.
 
 The [implementation plan](docs/IMPLEMENTATION_PLAN.md), [worklog](docs/WORKLOG.md),
@@ -87,6 +87,12 @@ The standalone `gz-fuel` executable accepts the optional `fuel` prefix used by
 Rust executable instead of a globally installed Fuel plugin. Installation also supplies a thin Ruby launcher for the existing `gz` plugin dispatcher; all command logic remains in Rust. The legacy exported
 `gzVersion`, `downloadUrl`, `listModels` and other command hooks are also provided.
 
+The shared library, standalone CLI, CMake package and pkg-config metadata support
+moving an installed prefix. The `gz` dispatcher manifest uses an absolute plugin
+path required by gz-tools. After moving the prefix, run
+`cmake --install <build-directory> --prefix <new-prefix>` to refresh that manifest
+before invoking `gz fuel` from the new location.
+
 ```sh
 gz-fuel list -t model -o OWNER --raw
 gz-fuel download -u https://fuel.gazebosim.org/1.0/OWNER/models/NAME
@@ -138,6 +144,9 @@ The coverage gate uses the LLVM tools shipped with the active Rust toolchain,
 starts with fresh profiles and counts all production Rust files, including FFI,
 CLI and error paths. Explicit `#[cfg(test)]` modules are excluded. C++ facade line
 coverage is measured and gated independently above 95% with gcov, including inline bridge helpers.
-Both CI jobs run on GitHub-hosted Ubuntu runners; C++ dependencies are built at
+Required CI jobs run on GitHub-hosted Ubuntu runners; C++ dependencies are built at
 pinned revisions and cached. Every PR must pass the `CI required` gate before
-merging into main, including administrator merges. See [CI and merge policy](docs/CI.md).
+merging into main, including administrator merges. CI also checks dependency policy, workflow syntax,
+version agreement, documentation and clean package installation. See
+[CI and merge policy](docs/CI.md), [contributor guidance](CONTRIBUTING.md),
+[security reporting](SECURITY.md) and [release preparation](RELEASING.md).

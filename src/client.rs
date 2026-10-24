@@ -126,7 +126,12 @@ pub fn parse_url(url: &str, config: &Value, kind: &str, file: bool) -> Option<Va
     Some(json!({"id":id,"file":file_path}))
 }
 fn headers(a: &Value, id: &Value) -> Value {
-    let mut out = a["headers"].as_array().cloned().unwrap_or_default();
+    let mut out =
+        if a["header_origin"].is_null() || a["header_origin"] == origin(s(&id["server"], "url")) {
+            a["headers"].as_array().cloned().unwrap_or_default()
+        } else {
+            vec![]
+        };
     if !out.iter().any(|h| {
         h.as_str()
             .and_then(|x| x.split_once(':'))
@@ -139,6 +144,12 @@ fn headers(a: &Value, id: &Value) -> Value {
         )));
     }
     json!(out)
+}
+fn origin(value: &str) -> Value {
+    url::Url::parse(value)
+        .ok()
+        .map(|url| json!([url.scheme(), url.host_str(), url.port_or_known_default()]))
+        .unwrap_or_else(|| json!(value))
 }
 fn request(
     a: &Value,
@@ -326,6 +337,11 @@ fn dep_closure(a: &Value, ids: Vec<Value>, recursive: bool) -> Value {
     json!({"result":4,"dependencies":out})
 }
 fn download(a: &Value) -> Value {
+    let mut scoped = a.clone();
+    if scoped["header_origin"].is_null() {
+        scoped["header_origin"] = origin(s(&a["id"]["server"], "url"));
+    }
+    let a = &scoped;
     let output = download_one(a);
     if output["result"] != 4 || s(a, "kind") != "models" {
         return output;
@@ -337,12 +353,16 @@ fn download(a: &Value) -> Value {
     output["dependencies"] = json!(deps);
     if a["recursive"].as_bool().unwrap_or(true) {
         let mut queue: VecDeque<Value> = deps.into();
-        let mut seen = HashSet::from([resource_key(&a["id"])]);
+        let mut seen = HashSet::from([resource_key(&a["id"]), resource_key(&output["id"])]);
         while let Some(id) = queue.pop_front() {
             if !seen.insert(resource_key(&id)) {
                 continue;
             }
-            if cached(a, &id, "models").is_some() {
+            if let Some(entry) = cached(a, &id, "models") {
+                let Some(next) = dependencies(a, &entry["id"]) else {
+                    return result(7);
+                };
+                queue.extend(next);
                 continue;
             }
             let mut sub = a.clone();
@@ -419,14 +439,7 @@ fn upload(a: &Value, patch: bool) -> Value {
                 if ty.is_dir() {
                     files(&e.path(), root, out)?;
                 } else if ty.is_file() {
-                    out.push(json!([
-                        "file",
-                        format!(
-                            "@{};{}",
-                            e.path().display(),
-                            e.path().strip_prefix(root).unwrap().display()
-                        )
-                    ]));
+                    out.push(json!(["file", {"file":e.path(),"filename":e.path().strip_prefix(root).unwrap()}]));
                 }
             }
             Ok(())
@@ -523,20 +536,26 @@ fn update(a: &Value) -> Value {
 }
 fn batch(a: &Value) -> Value {
     let jobs = a["jobs"].as_u64().unwrap_or(2).clamp(1, 64) as usize;
-    let mut pending = a["ids"].as_array().cloned().unwrap_or_default();
+    let mut pending = a["ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|id| (id.clone(), origin(s(&id["server"], "url"))))
+        .collect::<Vec<_>>();
     let mut seen = HashSet::new();
     let mut results = vec![];
     while !pending.is_empty() {
-        pending.retain(|id| seen.insert(resource_key(id)));
+        pending.retain(|(id, _)| seen.insert(resource_key(id)));
         let mut next = vec![];
         for chunk in pending.chunks(jobs) {
             let wave = std::thread::scope(|scope| {
                 let handles = chunk
                     .iter()
-                    .map(|id| {
+                    .map(|(id, header_origin)| {
                         scope.spawn(move || {
                             let mut args = a.clone();
                             args["id"] = id.clone();
+                            args["header_origin"] = header_origin.clone();
                             args["recursive"] = json!(false);
                             let mut out = download(&args);
                             out["requested_id"] = id.clone();
@@ -552,11 +571,11 @@ fn batch(a: &Value) -> Value {
                     .map(|h| h.join().unwrap_or_else(|_| result(7)))
                     .collect::<Vec<_>>()
             });
-            for out in wave {
+            for (out, (_, header_origin)) in wave.into_iter().zip(chunk) {
                 if s(a, "kind") == "models"
                     && let Some(deps) = out["dependencies"].as_array()
                 {
-                    next.extend(deps.iter().cloned());
+                    next.extend(deps.iter().cloned().map(|id| (id, header_origin.clone())));
                 }
                 results.push(out);
             }

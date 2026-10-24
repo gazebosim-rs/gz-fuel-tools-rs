@@ -107,3 +107,46 @@
   pushes and deletion disabled. Saved the policy as versioned JSON.
 - Canceled the obsolete queued workflow. Validating the updated workflow through
   its own pull request before merging the configuration.
+
+## Development lifecycle review
+
+- CI PR #1 passed all hosted jobs and merged through the required check, without
+  administrator bypass. Verified that live main protection still requires PRs,
+  current successful CI and administrator enforcement.
+- Ran separate reviews of implementation correctness, dependency/security policy,
+  and build/package/release readiness. The review found metadata/file ambiguity in
+  multipart uploads, cross-origin dependency credential forwarding, swallowed
+  listing failures, missing CLI listing headers and incomplete cached dependency
+  traversal. Added focused fixes and deterministic regressions.
+- Enabled repository secret scanning and push protection, Dependabot security fix
+  PRs and private vulnerability reporting. Added contributor, security and agent
+  guidance and weekly dependency/action update configuration.
+- Pinned action implementations to reviewed full revisions, added workflow linting
+  and documentation checks, and extended the aggregate merge gate to include
+  dependency policy. Release preparation remains separate from actual publishing.
+- Initial RustSec scan found unmaintained YAML dependencies and advisories against
+  the old ZIP dependency. Replacing affected dependencies instead of ignoring the
+  findings; final tests and audit evidence are recorded after validation below.
+- Replaced serde_yaml/unsafe-libyaml with maintained serde-saphyr and upgraded
+  ZIP to 9.1.0; all four cargo-deny domains pass with no advisory exceptions.
+- Full upstream parity exposed Fuel's header-advertised pagination completion and
+  empty-token YAML quoting. Preserved both contracts while retaining failure
+  propagation. Independent review added repeated Link and quoted-parameter cases.
+- Release checks pass on clean temporary snapshots, including crate verification,
+  source-only C++ builds, moved-prefix library/CLI consumers and Ruby dispatch.
+  Dispatcher YAML uses an absolute path and is refreshed by reinstalling after
+  moving, which is now documented and exercised.
+- Local final validation: 55 Rust unit tests, two CLI tests, four Python tests;
+  all 21 C++ suites pass. Rust coverage 2736/2815 = 97.1936%, C++ coverage
+  1319/1359 = 97.0567%. Formatting, Clippy and documentation checks pass.
+  Hosted CI independently repeats the gates on the protected pull request.
+- Hosted PR validation passed Rust, dependency/workflow policy and original C++
+  parity, then rejected packaging: unanchored Cargo filename globs matched README
+  and license files in the ignored nested upstream checkout. The required gate
+  failed and blocked merging. Anchoring distribution paths and checking both the
+  package file list and produced archive prevents this contamination without
+  allowing dirty packaging or weakening the clean-checkout rule.
+- The packaging regression now reproduces an ignored nested Git checkout using
+  real Cargo. All eight Python validation tests pass; a clean snapshot containing
+  the real upstream checkout produces and verifies exactly 26 native crate files,
+  with list/archive agreement and no upstream paths. No --allow-dirty is used.

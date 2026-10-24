@@ -6,6 +6,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+/// Gazebo-compatible CLI version spelling, including its prerelease suffix.
 pub const VERSION: &str = "12.0.0~pre2";
 const HELP: &str = "Gazebo Fuel resource tools\nUsage: gz-fuel [fuel] <action> [options]\nActions: list download upload delete edit update meta configure\nOptions: -u/--url URL -t/--type model|world -o/--owner OWNER -c/--config FILE\n         --header HEADER --raw -j/--jobs N -m/--model PATH --private --public\n         --force-version VERSION --versions -h/--help\nConfigure: --defaults permits overwrite; --console prints YAML; --cache DIR\n";
 /// Parse and execute one invocation. Zero means success; failures are nonzero.
@@ -175,11 +176,23 @@ fn configure(a: &Value) -> (i32, String) {
         .filter(|(key, _)| key.trim().eq_ignore_ascii_case("private-token"))
         .map(|(_, token)| token.trim())
         .unwrap_or("");
+    fn serialize_token<S: serde::Serializer>(
+        token: &str,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        // The upstream console format spells the empty token as two single
+        // quotes. Let the serializer escape every nonempty value normally.
+        if token.is_empty() {
+            serde::Serialize::serialize(&serde_saphyr::SingleQuoted(token), serializer)
+        } else {
+            serde::Serialize::serialize(token, serializer)
+        }
+    }
     #[derive(serde::Serialize)]
     struct SavedServer<'a> {
         name: &'a str,
         url: &'a str,
-        #[serde(rename = "private-token")]
+        #[serde(rename = "private-token", serialize_with = "serialize_token")]
         token: &'a str,
     }
     #[derive(serde::Serialize)]
@@ -201,7 +214,7 @@ fn configure(a: &Value) -> (i32, String) {
     };
     let yaml = format!(
         "---\n{}",
-        serde_yaml::to_string(&configuration).expect("string configuration serializes to YAML")
+        serde_saphyr::to_string(&configuration).expect("string configuration serializes to YAML")
     );
     if a["console"] == true {
         return (0, yaml);
@@ -329,6 +342,30 @@ mod tests {
     }
 
     #[test]
+    fn configure_defaults_console_preserves_upstream_yaml_format() {
+        let (status, output) = invoke(&[
+            "configure",
+            "--console",
+            "--defaults",
+            "--cache",
+            "/tmp/fuel-defaults-cache",
+        ]);
+        assert_eq!(status, 0);
+        assert_eq!(
+            output,
+            concat!(
+                "---\n",
+                "servers:\n",
+                "- name: Fuel\n",
+                "  url: https://fuel.gazebosim.org\n",
+                "  private-token: ''\n",
+                "cache:\n",
+                "  path: /tmp/fuel-defaults-cache\n"
+            )
+        );
+    }
+
+    #[test]
     fn configure_files_console_and_legacy_aliases() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("custom/config.yaml");
@@ -347,7 +384,7 @@ mod tests {
         let out = invoke(&args);
         assert_eq!(out.0, 0, "{}", out.1);
         let content = fs::read_to_string(&file).unwrap();
-        let parsed: Value = serde_yaml::from_str(&content).unwrap();
+        let parsed: Value = serde_saphyr::from_str(&content).unwrap();
         assert_eq!(parsed["cache"]["path"], cache.to_str().unwrap());
         assert_eq!(parsed["servers"][0]["url"], "https://example.com");
         assert_eq!(parsed["servers"][0]["private-token"], "test-token");
