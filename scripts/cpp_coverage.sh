@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cmake -S . -B build-cpp-coverage -DCMAKE_BUILD_TYPE=Debug -DFUEL_CPP_COVERAGE=ON

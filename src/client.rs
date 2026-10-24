@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 //! Shared model/world client operations. All storage and HTTP use the same IO layer.
 use serde_json::{Value, json};

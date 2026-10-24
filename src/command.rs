@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 //! Command operations and resource metadata conversion, shared by all frontends.
 use serde_json::{Map, Value, json};

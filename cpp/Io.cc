@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
+// SPDX-License-Identifier: Apache-2.0
 // Apache-2.0. C++ API adaptation; transport and archive algorithms live in Rust.
 #include "Bridge.hh"
 #include "gz/fuel_tools/Interface.hh"

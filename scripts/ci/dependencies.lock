@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 # Pinned to the Gazebo dependency revisions used for the rewrite's parity tests.
 gz-cmake ca67ea8460fc03da062780805feb01cb20f4e0ba
 gz-utils eafd2035e344eeb28ccab03409093637b89bee35

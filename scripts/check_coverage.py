@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 """Strict production line coverage; exclude only explicit Rust test modules/files.
 
 All production Rust files, including the FFI and error paths, are measured.

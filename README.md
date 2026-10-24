@@ -13,6 +13,10 @@ Production line coverage is **97.19% Rust** and **97.06% C++**. See the
 The [implementation plan](docs/IMPLEMENTATION_PLAN.md), [worklog](docs/WORKLOG.md),
 and [complete upstream issue triage](docs/ISSUE_TRIAGE.md) record scope and decisions.
 
+Copyright (C) 2026 Open Source Robotics Foundation. Licensed under
+[Apache License 2.0](LICENSE); see [NOTICE](NOTICE) for attribution. Retained
+upstream files preserve their original Open Source Robotics Foundation notices.
+
 ## Native Rust
 
 Rust builds require Cargo/Rust and OpenSSL development headers (`libssl-dev` and

@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 """Regression tests for production/test coverage separation."""
 import importlib.util
 from pathlib import Path

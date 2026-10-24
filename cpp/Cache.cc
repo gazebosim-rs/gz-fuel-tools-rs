@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
+// SPDX-License-Identifier: Apache-2.0
 // Apache-2.0. Historical private cache interface backed by the Rust cache.
 #include "Bridge.hh"
 #include "LocalCache.hh"

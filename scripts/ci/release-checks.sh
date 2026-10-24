@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 # Validate candidate artifacts; never create tags, GitHub releases or publications.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -43,6 +45,9 @@ cmake -S "$work/source" -B "$work/build" \
   -DCMAKE_INSTALL_PREFIX="$work/install" -DCMAKE_INSTALL_LIBDIR="$libdir"
 cmake --build "$work/build" --parallel "$jobs"
 cmake --install "$work/build"
+for document in LICENSE NOTICE; do
+  cmp "$work/source/$document" "$work/install/share/licenses/gz-fuel_tools/$document"
+done
 check_dispatcher "$work/install"
 mv "$work/install" "$work/relocated"
 export PKG_CONFIG_PATH="$work/relocated/$libdir/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"

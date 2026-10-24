@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 // Deterministic compatibility checks supplement the unchanged upstream suites.
 #include <gtest/gtest.h>

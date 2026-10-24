@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 // Exercises exported C frontend hooks, stream capture, return values and metadata.
 #include <gtest/gtest.h>

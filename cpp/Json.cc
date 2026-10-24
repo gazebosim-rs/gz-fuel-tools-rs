@@ -1,4 +1,5 @@
-// Copyright 2026 Open Source Robotics Foundation. SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Open Source Robotics Foundation
+// SPDX-License-Identifier: Apache-2.0
 #include "Bridge.hh"
 #include "gz/fuel_tools/JSONParser.hh"
 namespace gz::fuel_tools {

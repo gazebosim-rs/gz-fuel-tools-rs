@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 """Guard the crate against ignored checkout files and unsafe archive contents."""
 
 import importlib.util
@@ -28,8 +30,9 @@ class PackageContentsTests(unittest.TestCase):
 
     def test_missing_and_duplicate_files_are_rejected(self):
         files = sorted(CHECKER.REQUIRED_FILES)
-        with self.assertRaisesRegex(ValueError, "missing"):
-            CHECKER.check_paths([name for name in files if name != "LICENSE"])
+        for required in ("LICENSE", "NOTICE"):
+            with self.subTest(required=required), self.assertRaisesRegex(ValueError, "missing"):
+                CHECKER.check_paths([name for name in files if name != required])
         with self.assertRaisesRegex(ValueError, "Duplicate"):
             CHECKER.check_paths([*files, "LICENSE"])
 
