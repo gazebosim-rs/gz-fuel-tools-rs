@@ -355,3 +355,18 @@ are working-tree checks pending the final complete coverage/parity refresh.
   have not changed. Main protection was verified against GitHub's live API.
 - Preparing the committed candidate for clean source/crate installation and
   relocated consumer validation, followed by the required hosted PR checks.
+
+### Clean committed package and installation validation
+
+- `scripts/ci/release-checks.sh` passed for candidate commit
+  `0a1ca052f52c8cd2dd74c8ae60d19dd92e381a24` from a clean checkout.
+- Cargo verified the generated crate and its exact file list, including LICENSE,
+  NOTICE and embedded metadata schemas. A clean source archive built the Rust
+  library/CLI and C++ facade with tests disabled and no upstream source checkout.
+- Installed and relocated the candidate; all seven CMake target/variable consumer
+  variants passed. The separate pkg-config consumer, CLI version/help, Ruby
+  dispatcher, relocated include/library paths and installed license files passed.
+- Candidate archives, checksums and commit identity were generated only as local
+  validation artifacts. No crates.io package, release tag or GitHub release was
+  published. The protected PR's required hosted workflow repeats these checks
+  against its final checkout before merge.
