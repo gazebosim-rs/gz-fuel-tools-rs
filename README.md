@@ -80,8 +80,8 @@ target_link_libraries(my_app PRIVATE gz-fuel_tools::gz-fuel_tools)
 Existing `#include <gz/fuel_tools/FuelClient.hh>` and other public headers retain
 their class names, signatures, overloads, enum values, reference-returning methods,
 and iterator operators. Rebuild downstream code against these headers. The internal
-C ABI is implementation detail; it uses length-delimited buffers and byte arrays
-for binary bodies. Rust panics are caught at that boundary. C++ only adapts Gazebo
+C ABI is implementation detail; it uses independently owned length-delimited
+control and binary buffers. Rust panics are caught at that boundary. C++ only adapts Gazebo
 URI values, containers, stable references and iterator handles.
 
 `configure` runs deterministically without interactive prompts. `configure --console --defaults` prints the default YAML; `configure --defaults` writes it to the selected cache, and `--config` / `--cache` select locations. Existing files require `--defaults` to overwrite.
@@ -111,12 +111,15 @@ real credentials in scripts committed to source control.
 ## Storage and intentional corrections
 
 Models and worlds share resource parsing, HTTP and cache operations. Numeric cache
-versions determine the latest resource. Downloads extract to staging directories;
-failed replacement restores the previous cache entry. Cache paths preserve the
+versions determine the latest resource. Downloads extract and validate in staging directories. Writers coordinate across
+processes; Linux directory exchange publishes replacements atomically, preserving
+the previous entry if publication fails. A filesystem without atomic directory
+exchange rejects overwriting an existing entry. Cache paths preserve the
 legacy URI authority behavior required by existing C++ callers.
 
 - HTTPS verifies certificates. Resource path segments are encoded individually,
   preserving route separators and existing escapes.
+- Archive downloads and multipart file uploads stream through bounded buffers.
 - ZIPs are read/written as binary bytes. Absolute paths, traversal, drive escapes
   and symbolic links are rejected before extraction.
 - Model metadata and its main SDF must be valid before a download is published.
@@ -124,6 +127,34 @@ legacy URI authority behavior required by existing C++ callers.
   forwarded to referral URLs.
 - Failed requests and failed batch items propagate failure to callers and CLI exit
   status. Requested explicit versions survive a missing version response header.
+
+`ClientConfig::limits` configures finite response, archive, dependency and listing
+budgets. The same fields can be supplied under `limits:` in YAML, including for
+C++ callers loading a configuration file. Defaults allow a 1 GiB download, 8 GiB
+per download operation, 16 MiB metadata response, 100,000 ZIP entries, 2 GiB per
+expanded entry, and 8 GiB total expansion. Graphs allow 10,000 resources and 64
+levels; listings allow 10,000 pages, one million resources and 256 MiB total
+responses. Tune these budgets for the resources your application accepts.
+
+Connection setup defaults to 15 seconds and inactive transfer waits to 30 seconds.
+Progressing transfers have no whole-request deadline by default. For example:
+
+```yaml
+limits:
+  max_download_bytes: 2147483648
+  read_timeout_ms: 60000
+  request_timeout_ms: null
+```
+
+Native errors expose a category, optional HTTP status and underlying cause.
+Native filesystem operations retain `PathBuf`, including non-UTF8 Unix paths.
+Upload-relative asset filenames must be UTF-8; unrepresentable names return an
+error while non-UTF8 parent directories remain supported.
+Rust, CLI and C++ iterators share pagination checks; malformed or cyclic remote
+listings fail rather than silently returning a successful partial listing. The
+legacy C++ server-wide listing overload retains its initial cache fallback.
+Content-only CLI edits preserve visibility unless `--private` or `--public` is
+specified. Explicit Rust/C++ visibility operations retain their existing meaning.
 
 Server database migrations, backend uniqueness, Python bindings and new C++ API
 extensions are outside this rewrite. Native platforms other than Linux require

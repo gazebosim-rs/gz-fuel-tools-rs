@@ -139,7 +139,8 @@ class HttpFixture {
   std::string url;
   std::mutex mutex;
   std::vector<std::string> requests;
-  explicit HttpFixture(bool listening = true) {
+  explicit HttpFixture(bool listening = true, std::string pagination = "")
+      : pagination_(std::move(pagination)) {
     socket_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (socket_ < 0) throw std::runtime_error("cannot create fixture socket");
     sockaddr_in address{};
@@ -168,6 +169,7 @@ class HttpFixture {
   }
 
  private:
+  std::string pagination_;
   int socket_ = -1;
   std::atomic<bool> stop_{false};
   std::thread worker_;
@@ -223,8 +225,15 @@ class HttpFixture {
                    ? (route.find("page=1") != std::string::npos ? "[" + id + "]" : "[]")
                    : id;
       }
+      std::string paginationHeader;
+      if (!pagination_.empty()) {
+        const std::string name = route.find("page=2") != std::string::npos ? "b" : "a";
+        body = "[{\"name\":\"" + name + "\",\"owner\":\"alice\"}]";
+        if (pagination_ == "terminal") paginationHeader = "Link: </old>; rel=prev\r\n";
+      }
       std::string output =
           "HTTP/1.1 " + std::to_string(status) + (status == 200 ? " OK\r\n" : " Not Found\r\n");
+      output += paginationHeader;
       output += "Content-Length: " + std::to_string(body.size()) + "\r\nContent-Type: " + type;
       output += "\r\nX-Ign-Resource-Version: 2\r\nConnection: close\r\n\r\n" + body;
       std::size_t sent = 0;
@@ -478,6 +487,37 @@ TEST(FacadeCompatibility, OfflineListFallsBackToCachedModelsAndWorlds) {
   EXPECT_EQ("arena", worlds->Name());
 }
 
+TEST(FacadeCompatibility, RemoteIteratorsShareCompletionAndCycleDetection) {
+  for (const auto& mode : {"terminal", "cycle"}) {
+    HttpFixture http(true, mode);
+    Rest rest;
+    auto models = ModelIterFactory::Create(rest, server(http), "models");
+    ASSERT_TRUE(models);
+    EXPECT_EQ("a", models->Identification().Name());
+    if (std::string(mode) == "cycle") {
+      ++models;
+      ASSERT_TRUE(models);
+      EXPECT_EQ("b", models->Identification().Name());
+      EXPECT_THROW(++models, std::runtime_error);
+    }
+    ++models;
+    EXPECT_FALSE(models);
+    ++models;
+    auto worlds = WorldIterFactory::Create(rest, server(http), "worlds");
+    ASSERT_TRUE(worlds);
+    EXPECT_EQ("a", worlds->Name());
+    if (std::string(mode) == "cycle") {
+      ++worlds;
+      ASSERT_TRUE(worlds);
+      EXPECT_EQ("b", worlds->Name());
+      EXPECT_THROW(++worlds, std::runtime_error);
+    }
+    ++worlds;
+    EXPECT_FALSE(worlds);
+    ++worlds;
+    EXPECT_EQ(std::string(mode) == "cycle" ? 6u : 2u, http.requestCount());
+  }
+}
 TEST(FacadeCompatibility, IteratorOwnershipAndPrivateHelperContracts) {
   HttpFixture http;
   auto empty = ModelIterFactory::Create();
@@ -504,6 +544,31 @@ TEST(FacadeCompatibility, IteratorOwnershipAndPrivateHelperContracts) {
 }
 #endif
 
+TEST(FacadeCompatibility, OutOfRangeWireNumbersPreserveLegacyPartialValues) {
+  for (const auto& field : {"likes", "downloads", "filesize", "version"}) {
+    const std::string record =
+        "{\"name\":\"Robot\",\"owner\":\"Alice\",\"description\":\"before\",\"" +
+        std::string(field) + "\":4294967296}";
+    ModelIdentifier id;
+    EXPECT_NO_THROW(id = JSONParser::ParseModel(record, ServerConfig()));
+    EXPECT_EQ("robot", id.Name());
+    EXPECT_EQ("alice", id.Owner());
+    EXPECT_EQ("before", id.Description());
+    EXPECT_EQ(0u, id.Version());
+    const auto values = JSONParser::ParseModels(
+        "[{\"name\":\"first\"}," + record + ",{\"name\":\"last\"}]", ServerConfig());
+    ASSERT_EQ(1u, values.size());
+    EXPECT_EQ("first", values[0].Name());
+  }
+  std::map<std::string, unsigned int> licenses;
+  EXPECT_TRUE(
+      JSONParser::ParseLicenses("[{\"name\":\"first\",\"ID\":2},{\"name\":\"overflow\",\"ID\":"
+                                "4294967296},{\"name\":\"last\",\"ID\":4}]",
+                                licenses));
+  ASSERT_EQ(2u, licenses.size());
+  EXPECT_EQ(2u, licenses.at("first"));
+  EXPECT_EQ(4u, licenses.at("last"));
+}
 TEST(FacadeCompatibility, ValueCopiesMovesReferencesAndEmptyJson) {
   Result original(ResultType::FETCH), copied(original), assigned;
   assigned = copied;

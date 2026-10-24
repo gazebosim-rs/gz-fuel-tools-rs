@@ -1,0 +1,45 @@
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
+cmake_minimum_required(VERSION 3.22)
+project(fuel_external_consumer LANGUAGES CXX)
+enable_testing()
+find_package(gz-fuel_tools ${EXPECTED_MAJOR} REQUIRED COMPONENTS all)
+# Repeated package loads and the separate upstream all-component package must
+# preserve the same imported targets and compatibility variables.
+find_package(gz-fuel_tools ${EXPECTED_MAJOR} REQUIRED)
+find_package(gz-fuel_tools-all ${EXPECTED_MAJOR} REQUIRED)
+
+foreach(variable IN ITEMS gz-fuel_tools_CORE_LIBRARY gz-fuel_tools_LIBRARIES
+    gz-fuel_tools_INCLUDE_DIRS GZ-FUEL_TOOLS_LIBRARIES GZ-FUEL_TOOLS_INCLUDE_DIRS)
+  if(NOT DEFINED ${variable} OR "${${variable}}" STREQUAL "")
+    message(FATAL_ERROR "Missing upstream package variable: ${variable}")
+  endif()
+endforeach()
+if(NOT "${gz-fuel_tools_CORE_LIBRARY}" STREQUAL "gz-fuel_tools::core"
+    OR NOT "${gz-fuel_tools_LIBRARIES}" STREQUAL "gz-fuel_tools::requested")
+  message(FATAL_ERROR "Upstream package library variables changed their target names")
+endif()
+if(EXPECTED_PREFIX)
+  file(REAL_PATH "${gz-fuel_tools_INCLUDE_DIRS}" actual_include)
+  file(REAL_PATH "${EXPECTED_PREFIX}/include" expected_include)
+  if(NOT actual_include STREQUAL expected_include)
+    message(FATAL_ERROR "Include variable did not relocate: ${actual_include}")
+  endif()
+endif()
+
+function(fuel_consumer name)
+  add_executable(${name} main.cc)
+  target_compile_features(${name} PRIVATE cxx_std_17)
+  target_compile_definitions(${name} PRIVATE EXPECTED_MAJOR=${EXPECTED_MAJOR})
+  target_link_libraries(${name} PRIVATE ${ARGN})
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+fuel_consumer(consumer_cmake gz-fuel_tools::gz-fuel_tools)
+fuel_consumer(consumer_core gz-fuel_tools::core)
+fuel_consumer(consumer_requested gz-fuel_tools::requested)
+fuel_consumer(consumer_all gz-fuel_tools::all)
+fuel_consumer(consumer_plain gz-fuel_tools)
+fuel_consumer(consumer_variables ${gz-fuel_tools_LIBRARIES})
+target_include_directories(consumer_variables PRIVATE ${gz-fuel_tools_INCLUDE_DIRS})
+fuel_consumer(consumer_legacy_variables ${GZ-FUEL_TOOLS_LIBRARIES})
+target_include_directories(consumer_legacy_variables PRIVATE ${GZ-FUEL_TOOLS_INCLUDE_DIRS})

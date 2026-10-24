@@ -1,13 +1,13 @@
 // Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 //! Blocking transport, safe archives, and the on-disk Fuel cache.
-use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
-use reqwest::blocking::{Client, multipart};
+use crate::{
+    CachedResource, ClientConfig, Error, ResourceId, ResourceKind, ResourceLimits, ServerConfig,
+};
 use serde_json::{Value, json};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 use zip::write::SimpleFileOptions;
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -46,21 +46,107 @@ fn no_symlinks(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Check the declared raw entry count before ZipArchive allocates its central
+// directory. Its public len() deduplicates names and is too late to bound work.
+fn archive_directory_budget<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+    limits: &ResourceLimits,
+) -> io::Result<()> {
+    let tail_size = size.min(65_557) as usize;
+    reader.seek(io::SeekFrom::End(-(tail_size as i64)))?;
+    let mut tail = vec![0; tail_size];
+    reader.read_exact(&mut tail)?;
+    let footer = tail
+        .windows(4)
+        .enumerate()
+        .rev()
+        .find_map(|(offset, magic)| {
+            if magic != b"PK\x05\x06" || offset + 22 > tail.len() {
+                return None;
+            }
+            let comment = u16::from_le_bytes([tail[offset + 20], tail[offset + 21]]) as usize;
+            (offset + 22 + comment == tail.len()).then_some(offset)
+        })
+        .ok_or_else(|| invalid("missing ZIP end record"))?;
+    let mut entries = u16::from_le_bytes([tail[footer + 10], tail[footer + 11]]) as u64;
+    if footer >= 20 && &tail[footer - 20..footer - 16] == b"PK\x06\x07" {
+        let record_offset = u64::from_le_bytes(
+            tail[footer - 12..footer - 4]
+                .try_into()
+                .map_err(|_| invalid("invalid ZIP64 locator"))?,
+        );
+        reader.seek(io::SeekFrom::Start(record_offset))?;
+        let mut record = [0; 56];
+        reader.read_exact(&mut record)?;
+        if &record[..4] != b"PK\x06\x06" {
+            return Err(invalid("invalid ZIP64 end record"));
+        }
+        let record_size = u64::from_le_bytes(
+            record[4..12]
+                .try_into()
+                .map_err(|_| invalid("invalid ZIP64 record size"))?,
+        );
+        if record_size > limits.max_metadata_bytes {
+            return Err(limit_error("ZIP64 metadata exceeds byte limit"));
+        }
+        entries = u64::from_le_bytes(
+            record[32..40]
+                .try_into()
+                .map_err(|_| invalid("invalid ZIP64 entry count"))?,
+        );
+    }
+    if entries > limits.max_archive_entries as u64 {
+        return Err(limit_error("archive exceeds entry count limit"));
+    }
+    reader.rewind()?;
+    Ok(())
+}
+
 fn extract<R: Read + Seek>(reader: R, destination: &Path) -> io::Result<()> {
+    extract_with_limits(reader, destination, &ResourceLimits::default())
+}
+
+fn extract_with_limits<R: Read + Seek>(
+    mut reader: R,
+    destination: &Path,
+    limits: &ResourceLimits,
+) -> io::Result<()> {
     no_symlinks(destination)?;
+    let compressed_size = reader.seek(io::SeekFrom::End(0))?;
+    if compressed_size > limits.max_download_bytes {
+        return Err(limit_error("archive exceeds compressed byte limit"));
+    }
+    archive_directory_budget(&mut reader, compressed_size, limits)?;
     let mut archive = zip::ZipArchive::new(reader)?;
-    // Validate every entry before writing anything. Backslashes and drive prefixes
-    // are rejected on every platform, including when creating a Windows cache.
+    if archive.len() > limits.max_archive_entries {
+        return Err(limit_error("archive exceeds entry count limit"));
+    }
+    let mut declared_total = 0_u64;
+    // Validate the complete directory before creating files. Enforce both declared
+    // sizes here and actual decompressed bytes below: ZIP headers are untrusted.
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
         let filename = entry.name()?;
         let name = filename.trim_end_matches('/');
-        if !safe_relative(Path::new(name)) || entry.is_symlink() {
+        let path = Path::new(name);
+        if !safe_relative(path) || entry.is_symlink() {
             return Err(invalid("unsafe archive entry"));
         }
-        no_symlinks(&destination.join(name))?;
+        if path.components().count() > limits.max_archive_depth {
+            return Err(limit_error("archive exceeds path depth limit"));
+        }
+        if entry.size() > limits.max_archive_entry_bytes {
+            return Err(limit_error("archive entry exceeds byte limit"));
+        }
+        declared_total = declared_total
+            .checked_add(entry.size())
+            .filter(|size| *size <= limits.max_archive_total_bytes)
+            .ok_or_else(|| limit_error("archive exceeds total extracted byte limit"))?;
+        no_symlinks(&destination.join(path))?;
     }
     fs::create_dir_all(destination)?;
+    let mut actual_total = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let output = destination.join(entry.name()?.as_ref());
@@ -70,22 +156,36 @@ fn extract<R: Read + Seek>(reader: R, destination: &Path) -> io::Result<()> {
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
+            no_symlinks(&output)?;
             let mut file = File::create(output)?;
-            io::copy(&mut entry, &mut file)?;
+            let available = limits
+                .max_archive_entry_bytes
+                .min(limits.max_archive_total_bytes.saturating_sub(actual_total));
+            let copied = io::copy(
+                &mut entry.by_ref().take(available.saturating_add(1)),
+                &mut file,
+            )?;
+            if copied > available {
+                return Err(limit_error("archive exceeds extracted byte limit"));
+            }
+            actual_total += copied;
         }
     }
     Ok(())
 }
 
-fn sorted_children(path: &Path) -> Vec<PathBuf> {
-    let mut entries = fs::read_dir(path)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .collect::<Vec<_>>();
+fn read_children(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut entries = fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()?;
     entries.sort();
-    entries
+    Ok(entries)
+}
+
+// Enumeration intentionally tolerates unreadable cache entries. Compression uses
+// read_children directly so a successful archive never hides an unreadable tree.
+fn sorted_children(path: &Path) -> Vec<PathBuf> {
+    read_children(path).unwrap_or_default()
 }
 fn add_entry<W: Write + Seek>(
     writer: &mut zip::ZipWriter<W>,
@@ -104,7 +204,7 @@ fn add_entry<W: Write + Seek>(
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     if metadata.is_dir() {
         writer.add_directory(format!("{name}/"), options)?;
-        for child in sorted_children(path) {
+        for child in read_children(path)? {
             add_entry(writer, &child, root)?;
         }
     } else if metadata.is_file() {
@@ -131,334 +231,397 @@ pub fn compress(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn join_url(a: &str, b: &str) -> String {
-    if a.is_empty() {
-        return b.to_owned();
-    }
-    if b.is_empty() {
-        return a.to_owned();
-    }
-    format!("{}/{}", a.trim_end_matches('/'), b.trim_start_matches('/'))
-}
-fn mime(path: &str) -> &'static str {
-    match Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "config" | "dae" | "sdf" | "urdf" | "xml" => "text/xml",
-        "gif" => "image/gif",
-        "htm" | "html" => "text/html",
-        "jpg" | "jpeg" => "image/jpeg",
-        "json" | "pbtxt" => "text/json",
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "svg" => "image/svg+xml",
-        "tga" => "image/tga",
-        "bvh" | "erb" | "obj" | "glsl" | "material" | "md" | "mtl" | "stl" | "txt" => "text/plain",
-        _ => "application/octet-stream",
-    }
-}
-/// HTTP response with an owned byte buffer. Native downloads never turn archive
-/// bytes into JSON values; serialization is confined to the C++ Rest adapter.
-#[derive(Debug)]
-pub struct Response {
-    pub status: u16,
-    pub headers: std::collections::BTreeMap<String, String>,
-    pub data: Vec<u8>,
-    pub error: Option<String>,
-}
-fn request_inner(a: &Value) -> Result<Response, Box<dyn std::error::Error>> {
-    let mut endpoint = join_url(s(a, "url"), s(a, "version"));
-    if !s(a, "path").is_empty() {
-        const SEGMENT: &percent_encoding::AsciiSet = &NON_ALPHANUMERIC
-            .remove(b'-')
-            .remove(b'_')
-            .remove(b'.')
-            .remove(b'~');
-        let encoded = if a["path_encoded"] == true {
-            s(a, "path").to_owned()
-        } else {
-            s(a, "path")
-                .split('/')
-                .map(|part| {
-                    percent_decode_str(part)
-                        .decode_utf8()
-                        .map(|decoded| utf8_percent_encode(&decoded, SEGMENT).to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .join("/")
-        };
-        endpoint = join_url(&endpoint, &encoded);
-    }
-    let query = a["query"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>()
-        .join("&");
-    if !query.is_empty() {
-        endpoint.push('?');
-        endpoint.push_str(&query);
-    }
-    let method = match a["method"].as_u64().unwrap_or(0) {
-        0 => reqwest::Method::GET,
-        1 | 5 => reqwest::Method::POST,
-        2 => reqwest::Method::DELETE,
-        3 => reqwest::Method::PUT,
-        4 | 6 => reqwest::Method::PATCH,
-        _ => return Err(invalid("unknown HTTP method").into()),
-    };
-    // Custom authentication headers have no universal names. Keep every caller
-    // header on its original origin instead of guessing which contain secrets.
-    let caller_headers = a["headers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .next()
-        .is_some();
-    let client = Client::builder()
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= 3 {
-                return attempt.error("too many redirects");
-            }
-            if let Some(previous) = attempt.previous().last() {
-                let next = attempt.url();
-                if previous.scheme() == "https" && next.scheme() != "https" {
-                    return attempt.error("HTTPS downgrade redirect refused");
-                }
-                if caller_headers
-                    && (
-                        previous.scheme(),
-                        previous.host_str(),
-                        previous.port_or_known_default(),
-                    ) != (next.scheme(), next.host_str(), next.port_or_known_default())
-                {
-                    return attempt.error("cross-origin redirect with caller headers refused");
-                }
-            }
-            attempt.follow()
-        }))
-        .build()?;
-    let mut request = client
-        .request(method, endpoint)
-        .header(reqwest::header::USER_AGENT, s(a, "user_agent"));
-    for header in a["headers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
-        let (name, value) = header
-            .split_once(':')
-            .ok_or_else(|| invalid("invalid HTTP header"))?;
-        request = request.header(
-            reqwest::header::HeaderName::from_bytes(name.trim().as_bytes())?,
-            value.trim(),
-        );
-    }
-    if matches!(a["method"].as_u64(), Some(5 | 6)) {
-        let mut form = multipart::Form::new();
-        for pair in a["form"].as_array().into_iter().flatten() {
-            let key = pair[0]
-                .as_str()
-                .ok_or_else(|| invalid("invalid form field"))?
-                .to_owned();
-            if let Some(path) = pair[1]["file"].as_str() {
-                let filename = pair[1]["filename"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| {
-                        Path::new(path)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    });
-                form = form.part(
-                    key,
-                    multipart::Part::bytes(fs::read(path)?)
-                        .file_name(filename)
-                        .mime_str(mime(path))?,
-                );
-            } else {
-                let value = pair[1]
-                    .as_str()
-                    .ok_or_else(|| invalid("invalid form value"))?;
-                form = form.text(key, value.to_owned());
-            }
-        }
-        request = request.multipart(form);
-    } else if matches!(a["method"].as_u64(), Some(1 | 3 | 4)) {
-        request = request.body(bytes(&a["data"]));
-    }
-    let response = request.send()?;
-    let status = response.status().as_u16();
-    let mut headers = std::collections::BTreeMap::<String, String>::new();
-    for (key, value) in response.headers() {
-        // HTTP fields are case insensitive. Keep the conventional names consumed
-        // by the historical facade as aliases for old callers.
-        let mut value = value.to_str()?.trim().to_owned();
-        // Link is a list-valued field. Preserve every field line so a later
-        // rel=prev cannot overwrite rel=next and truncate a paginated listing.
-        if key.as_str() == "link"
-            && let Some(previous) = headers.get("link")
-        {
-            value = format!("{previous}, {value}");
-        }
-        headers.insert(key.to_string(), value.clone());
-        let conventional = key
-            .as_str()
-            .split('-')
-            .map(|p| {
-                let mut c = p.chars();
-                c.next()
-                    .map(|h| h.to_ascii_uppercase().to_string() + c.as_str())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>()
-            .join("-");
-        headers.insert(conventional, value);
-    }
-    Ok(Response {
-        status,
-        headers,
-        data: response.bytes()?.to_vec(),
-        error: None,
-    })
-}
-pub fn transport(a: &Value) -> Response {
-    request_inner(a).unwrap_or_else(|e| Response {
-        status: 0,
-        headers: Default::default(),
-        data: vec![],
-        error: Some(e.to_string()),
-    })
-}
-pub fn request(a: &Value) -> Value {
-    // The historical Rest API encodes file fields as @path;filename. Keep that
-    // convention at this adapter boundary; internal text is always literal.
-    let mut a = a.clone();
-    if let Some(form) = a["form"].as_array_mut() {
-        for pair in form {
-            if let Some(file) = pair[1].as_str().and_then(|v| v.strip_prefix('@')) {
-                let (path, filename) = file.split_once(';').unwrap_or((file, ""));
-                pair[1] = if filename.is_empty() {
-                    json!({"file":path})
-                } else {
-                    json!({"file":path,"filename":filename})
-                };
-            }
-        }
-    }
-    let response = transport(&a);
-    json!({"status":response.status,"headers":response.headers,"data":response.data,"error":response.error})
-}
+pub(crate) use crate::transport::request;
 
-pub fn server_path(server: &Value) -> Option<PathBuf> {
-    let raw = s(server, "url");
-    let (_, rest) = raw.split_once("://")?;
+fn cache_server_path(server: &ServerConfig) -> io::Result<PathBuf> {
+    let (_, rest) = server
+        .url
+        .split_once("://")
+        .ok_or_else(|| invalid("invalid cache server"))?;
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     if authority.is_empty() {
-        return None;
+        return Err(invalid("invalid cache server authority"));
     }
-    let authority = if server["has_authority"].as_bool().unwrap_or(true) {
+    let authority = if server.has_authority {
         authority.replace(':', "%3A").replace('@', "%40")
     } else {
         authority.to_owned()
     };
     let path = PathBuf::from(authority).join(path.trim_matches('/'));
-    // The legacy URI parser permits a colon inside a path component when its
-    // authority parsing is disabled. Preserve that spelling for cache lookup.
-    let safe = !path.as_os_str().is_empty()
-        && path.components().all(|c| matches!(c, Component::Normal(_)))
-        && !path.to_string_lossy().contains('\\');
-    safe.then_some(path)
-}
-fn version(id: &Value) -> u64 {
-    id["version"].as_u64().unwrap_or(0)
-}
-fn id_matches(id: &Value, candidate: &Value, exact: bool) -> bool {
-    ["name", "owner"]
-        .iter()
-        .all(|key| (!exact && s(id, key).is_empty()) || s(id, key) == s(candidate, key))
-        && ((!exact && s(&id["server"], "url").is_empty())
-            || s(&id["server"], "url") == s(&candidate["server"], "url"))
-        && (!exact || version(id) == 0 || version(id) == version(candidate))
-}
-pub fn cache_list(a: &Value) -> Value {
-    let config = &a["config"];
-    let exact = a["exact"].as_bool().unwrap_or(false);
-    let kind = s(a, "kind");
-    if !matches!(kind, "models" | "worlds") {
-        return json!([]);
-    }
-    let filter = &a["id"];
-    if !filter.is_null()
-        && !exact
-        && ["name", "owner"].iter().all(|k| s(filter, k).is_empty())
-        && s(&filter["server"], "url").is_empty()
+    if path.as_os_str().is_empty()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        || path.to_string_lossy().contains(['\\', '\0'])
     {
-        return json!([]);
+        return Err(invalid("unsafe cache server path"));
     }
-    let mut servers = config["servers"].as_array().cloned().unwrap_or_default();
-    if exact {
-        servers = vec![filter["server"].clone()];
+    Ok(path)
+}
+
+#[cfg(test)]
+pub fn server_path(server: &Value) -> Option<PathBuf> {
+    cache_server_path(&ServerConfig {
+        url: s(server, "url").to_owned(),
+        has_authority: server["has_authority"].as_bool().unwrap_or(true),
+        ..ServerConfig::default()
+    })
+    .ok()
+}
+
+fn cache_id(id: &ResourceId, kind: ResourceKind) -> Result<ResourceId, Error> {
+    if kind == ResourceKind::Collection {
+        return Err(Error::new(
+            crate::ErrorKind::InvalidInput,
+            "collections cannot be cached",
+        ));
+    }
+    let id = crate::identity::canonicalize(id, kind)?;
+    if !safe_relative(Path::new(&id.owner))
+        || !safe_relative(Path::new(&id.name))
+        || id.owner.contains('/')
+        || id.name.contains('/')
+    {
+        return Err(Error::new(
+            crate::ErrorKind::InvalidInput,
+            "unsafe cache identifier",
+        ));
+    }
+    Ok(id)
+}
+
+fn resource_parent(
+    config: &ClientConfig,
+    kind: ResourceKind,
+    id: &ResourceId,
+) -> Result<PathBuf, Error> {
+    Ok(config
+        .cache_location
+        .join(cache_server_path(&id.server)?)
+        .join(&id.owner)
+        .join(kind.route())
+        .join(&id.name))
+}
+
+fn cached_entry(
+    kind: ResourceKind,
+    mut id: ResourceId,
+    path: PathBuf,
+) -> io::Result<Option<CachedResource>> {
+    no_symlinks(&path)?;
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    if kind == ResourceKind::Model {
+        let mut found = false;
+        for name in ["model.config", "metadata.pbtxt"] {
+            let file = path.join(name);
+            no_symlinks(&file)?;
+            found |= file.is_file();
+        }
+        if !found {
+            return Ok(None);
+        }
+    }
+    let path = fs::canonicalize(path)?;
+    id.local_path = path.clone();
+    Ok(Some(CachedResource { id, path }))
+}
+
+/// Look up exactly one resource. Numeric versions touch only their known path;
+/// tip scans only that resource's version directories, never unrelated resources.
+pub(crate) fn lookup_resource(
+    config: &ClientConfig,
+    kind: ResourceKind,
+    id: &ResourceId,
+) -> Result<Option<CachedResource>, Error> {
+    let id = cache_id(id, kind)?;
+    let parent = resource_parent(config, kind, &id)?;
+    let mut best = lookup_parent(kind, &id, &parent)?;
+    if id.version != 0 && best.is_some() {
+        return Ok(best);
+    }
+    // Historical caches can contain mixed-case directory spellings. Explicit
+    // canonical hits remain O(1); tip compares numeric versions across matching
+    // owner/resource siblings without inspecting unrelated resource contents.
+    let server = config.cache_location.join(cache_server_path(&id.server)?);
+    for owner in matching_children(&server, &id.owner)? {
+        for name in matching_children(&owner.join(kind.route()), &id.name)? {
+            if name == parent {
+                continue;
+            }
+            if let Some(entry) = lookup_parent(kind, &id, &name)? {
+                if id.version != 0 {
+                    return Ok(Some(entry));
+                }
+                if best
+                    .as_ref()
+                    .is_none_or(|old| old.id.version < entry.id.version)
+                {
+                    best = Some(entry);
+                }
+            }
+        }
+    }
+    Ok(best)
+}
+fn matching_children(parent: &Path, requested: &str) -> io::Result<Vec<PathBuf>> {
+    no_symlinks(parent)?;
+    let children = match read_children(parent) {
+        Ok(children) => children,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(children
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+        })
+        .filter(|path| no_symlinks(path).is_ok() && path.is_dir())
+        .collect())
+}
+fn lookup_parent(
+    kind: ResourceKind,
+    id: &ResourceId,
+    parent: &Path,
+) -> Result<Option<CachedResource>, Error> {
+    no_symlinks(parent)?;
+    if id.version != 0 {
+        return Ok(cached_entry(
+            kind,
+            id.clone(),
+            parent.join(id.version.to_string()),
+        )?);
+    }
+    let children = match read_children(parent) {
+        Ok(children) => children,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut versions = children
+        .into_iter()
+        .filter_map(|path| {
+            let version = path.file_name()?.to_str()?.parse::<u32>().ok()?;
+            (version > 0).then_some((version, path))
+        })
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|(version, _)| std::cmp::Reverse(*version));
+    for (version, path) in versions {
+        let mut candidate = id.clone();
+        candidate.version = version;
+        if let Some(entry) = cached_entry(kind, candidate, path)? {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
+/// Enumerate existing cached versions, omitting unreadable/unusable entries.
+pub(crate) fn cached_resources(
+    config: &ClientConfig,
+    kind: ResourceKind,
+    filter: Option<&ResourceId>,
+) -> Result<Vec<CachedResource>, Error> {
+    if kind == ResourceKind::Collection {
+        return Ok(Vec::new());
     }
     let mut result = Vec::new();
-    for server in servers {
-        let Some(relative) = server_path(&server) else {
+    for server in &config.servers {
+        if filter.is_some_and(|filter| {
+            !filter.server.url.is_empty()
+                && filter.server.url.trim_end_matches('/') != server.url.trim_end_matches('/')
+        }) {
+            continue;
+        }
+        let Ok(relative) = cache_server_path(server) else {
             continue;
         };
-        let root = Path::new(s(config, "cache_location")).join(relative);
+        let root = config.cache_location.join(relative);
         if no_symlinks(&root).is_err() {
             continue;
         }
-        for owner in sorted_children(&root).into_iter().filter(|p| p.is_dir()) {
-            for name in sorted_children(&owner.join(kind))
-                .into_iter()
-                .filter(|p| p.is_dir())
-            {
-                for path in sorted_children(&name).into_iter().filter(|p| p.is_dir()) {
-                    if no_symlinks(&path).is_err() {
-                        continue;
-                    }
-                    let Some(number) = path
+        for owner in sorted_children(&root) {
+            let Some(owner_name) = owner.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let owner_name = owner_name.to_ascii_lowercase();
+            if filter.is_some_and(|filter| {
+                !filter.owner.is_empty() && !filter.owner.eq_ignore_ascii_case(&owner_name)
+            }) {
+                continue;
+            }
+            if no_symlinks(&owner).is_err() || !owner.is_dir() {
+                continue;
+            }
+            for name in sorted_children(&owner.join(kind.route())) {
+                let Some(resource_name) = name.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let resource_name = resource_name.to_ascii_lowercase();
+                if filter.is_some_and(|filter| {
+                    !filter.name.is_empty() && !filter.name.eq_ignore_ascii_case(&resource_name)
+                }) {
+                    continue;
+                }
+                if no_symlinks(&name).is_err() || !name.is_dir() {
+                    continue;
+                }
+                for path in sorted_children(&name) {
+                    let Some(version) = path
                         .file_name()
-                        .and_then(|n| n.to_str())
-                        .and_then(|n| n.parse::<u32>().ok())
-                        .filter(|n| *n > 0)
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.parse::<u32>().ok())
+                        .filter(|version| *version > 0)
                     else {
                         continue;
                     };
-                    if kind == "models"
-                        && !path.join("model.config").is_file()
-                        && !path.join("metadata.pbtxt").is_file()
-                    {
+                    let id = ResourceId {
+                        name: resource_name.clone(),
+                        owner: owner_name.clone(),
+                        server: server.clone(),
+                        version,
+                        ..ResourceId::default()
+                    };
+                    if cache_id(&id, kind).is_err() {
                         continue;
                     }
-                    let Ok(path) = fs::canonicalize(path) else {
-                        continue;
-                    };
-                    let id = json!({"name":name.file_name().unwrap_or_default().to_string_lossy().to_lowercase(),"owner":owner.file_name().unwrap_or_default().to_string_lossy().to_lowercase(),"server":server,"version":number,"local_path":path.to_string_lossy()});
-                    if filter.is_null() || id_matches(filter, &id, exact) {
-                        result.push(json!({"id":id,"path":path.to_string_lossy()}));
+                    if let Ok(Some(entry)) = cached_entry(kind, id, path) {
+                        result.push(entry);
                     }
                 }
             }
         }
     }
-    if exact {
-        result.sort_by_key(|v| std::cmp::Reverse(version(&v["id"])));
-        result.truncate(1);
+    Ok(result)
+}
+
+fn resource_lock(parent: &Path, _version: u32, exclusive: bool) -> io::Result<File> {
+    no_symlinks(parent)?;
+    #[cfg(target_os = "linux")]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The resource parent is never exchanged. Linux flock supports a
+        // read-only directory descriptor, so immutable legacy caches need no
+        // writable sidecar. All versions of this resource share publication and
+        // metadata-read locks; unrelated resources still proceed independently.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent)?;
+        if !file.metadata()?.is_dir() {
+            return Err(invalid("cache lock is not a directory"));
+        }
+        file
+    };
+    #[cfg(not(target_os = "linux"))]
+    let file = {
+        let path = parent.join(format!(".fuel-{_version}.lock"));
+        no_symlinks(&path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(invalid("cache lock is not a regular file"));
+        }
+        file
+    };
+    if exclusive {
+        file.lock()?;
+    } else {
+        file.lock_shared()?;
     }
-    json!(result)
+    Ok(file)
+}
+
+/// Hold a shared resource publication lock throughout a multi-file read.
+pub(crate) fn with_cached_resource<T>(
+    config: &ClientConfig,
+    kind: ResourceKind,
+    id: &ResourceId,
+    read: impl FnOnce(&CachedResource) -> Result<T, Error>,
+) -> Result<Option<T>, Error> {
+    let Some(entry) = lookup_resource(config, kind, id)? else {
+        return Ok(None);
+    };
+    let parent = entry
+        .path
+        .parent()
+        .ok_or_else(|| invalid("cache resource has no parent"))?;
+    let _lock = resource_lock(parent, entry.id.version, false)?;
+    let Some(entry) = cached_entry(kind, entry.id, entry.path)? else {
+        return Ok(None);
+    };
+    read(&entry).map(Some)
+}
+
+fn kind_from_value(a: &Value) -> Option<ResourceKind> {
+    match s(a, "kind") {
+        "models" => Some(ResourceKind::Model),
+        "worlds" => Some(ResourceKind::World),
+        _ => None,
+    }
+}
+
+pub fn cache_list(a: &Value) -> Value {
+    let Some(kind) = kind_from_value(a) else {
+        return json!([]);
+    };
+    if !a["config"].is_object() {
+        return json!([]);
+    }
+    let Ok(config) = crate::core::typed_config(&a["config"]) else {
+        return json!([]);
+    };
+    let exact = a["exact"].as_bool().unwrap_or(false);
+    let mut filter = if a["id"].is_null() {
+        None
+    } else {
+        serde_json::from_value::<ResourceId>(a["id"].clone()).ok()
+    };
+    if !a["id"].is_null() && filter.is_none() {
+        return json!([]);
+    }
+    if let Some(filter) = &mut filter
+        && a["id"]["server"]["url"].is_null()
+    {
+        filter.server.url.clear();
+    }
+    if !exact
+        && filter
+            .as_ref()
+            .is_some_and(|id| id.name.is_empty() && id.owner.is_empty() && id.server.url.is_empty())
+    {
+        return json!([]);
+    }
+    let entries = if exact {
+        filter
+            .as_ref()
+            .and_then(|id| lookup_resource(&config, kind, id).ok().flatten())
+            .into_iter()
+            .collect()
+    } else {
+        cached_resources(&config, kind, filter.as_ref()).unwrap_or_default()
+    };
+    json!(
+        entries
+            .into_iter()
+            .map(|entry| json!({"id":entry.id,"path":entry.path}))
+            .collect::<Vec<_>>()
+    )
 }
 
 fn semantic_version(text: &str) -> Vec<u64> {
@@ -479,37 +642,46 @@ fn xml_sdf(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 fn metadata_file(text: &str) -> Option<String> {
-    let metadata = crate::command::parse_pbtxt(text).ok()?;
-    metadata["model"]["file"]
-        .as_str()
-        .or_else(|| metadata["world"]["file"].as_str())
-        .map(str::to_owned)
+    crate::metadata::parse_pbtxt(text)
+        .ok()?
+        .resource_file()
+        .map(|file| file.file.clone())
 }
 pub fn sdf_path(path: &Path) -> Option<PathBuf> {
+    sdf_path_with_limits(path, &ResourceLimits::default())
+        .ok()
+        .flatten()
+}
+fn sdf_path_with_limits(path: &Path, limits: &ResourceLimits) -> io::Result<Option<PathBuf>> {
     let metadata = path.join("metadata.pbtxt");
     let config = path.join("model.config");
     if metadata.exists() || config.exists() {
         let filename = if metadata.exists() {
-            metadata_file(&fs::read_to_string(metadata).ok()?)
+            metadata_file(&read_text_limited(&metadata, limits.max_metadata_bytes)?)
         } else {
-            xml_sdf(&fs::read_to_string(config).ok()?)
-        }?;
-        return safe_relative(Path::new(&filename)).then(|| path.join(filename));
+            xml_sdf(&read_text_limited(&config, limits.max_metadata_bytes)?)
+        };
+        return Ok(filename
+            .filter(|filename| safe_relative(Path::new(filename)))
+            .map(|filename| path.join(filename)));
     }
-    sorted_children(path)
-        .into_iter()
-        .find(|p| p.is_file() && p.extension().is_some_and(|e| e == "sdf"))
+    Ok(sorted_children(path).into_iter().find(|path| {
+        path.is_file() && path.extension().is_some_and(|extension| extension == "sdf")
+    }))
 }
-fn fix_model_paths(path: &Path, id: &Value) -> io::Result<()> {
-    if !path.join("metadata.pbtxt").is_file() && !path.join("model.config").is_file() {
-        return Err(invalid("missing model metadata"));
-    }
-    let file = sdf_path(path).ok_or_else(|| invalid("missing or invalid model metadata"))?;
-    let text = fs::read_to_string(&file)?;
+fn fix_model_paths(
+    path: &Path,
+    id: &ResourceId,
+    limits: &ResourceLimits,
+    relative: &Path,
+) -> io::Result<()> {
+    let file = path.join(relative);
+    let text = read_text_limited(&file, limits.max_metadata_bytes)?;
     let parse_text = text.trim_start();
     let prefix = text.len() - parse_text.len();
     let document = roxmltree::Document::parse(parse_text).map_err(|e| invalid(&e.to_string()))?;
     let mut replacements = Vec::new();
+    let mut output_size = text.len() as u64;
     for node in document.descendants().filter(|n| {
         n.is_element()
             && matches!(
@@ -536,19 +708,34 @@ fn fix_model_paths(path: &Path, id: &Value) -> io::Result<()> {
         let Some(text_node) = node.children().find(|n| n.is_text()) else {
             continue;
         };
-        let url = format!(
-            "{}/{}/{}/models/{}/{}/files/{}",
-            s(&id["server"], "url").trim_end_matches('/'),
-            s(&id["server"], "version"),
-            s(id, "owner"),
-            s(id, "name"),
-            version(id),
-            suffix
-        );
-        replacements.push((
-            (text_node.range().start + prefix)..(text_node.range().end + prefix),
-            url.replace('&', "&amp;").replace('<', "&lt;"),
-        ));
+        let mut url = crate::identity::resource_url(id, ResourceKind::Model, true, true)
+            .map_err(|error| invalid(&error.to_string()))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| invalid("invalid resource URL"))?;
+            segments.push("files");
+            for segment in suffix.split('/') {
+                let decoded = percent_encoding::percent_decode_str(segment)
+                    .decode_utf8()
+                    .map_err(|_| invalid("asset URI is not valid UTF-8"))?;
+                if decoded.split('/').any(|part| matches!(part, "." | ".."))
+                    || decoded.contains(['\\', '\0'])
+                {
+                    return Err(invalid("unsafe asset URI path"));
+                }
+                segments.push(&decoded);
+            }
+        }
+        let url = url.to_string();
+        let replacement = url.replace('&', "&amp;").replace('<', "&lt;");
+        let range = (text_node.range().start + prefix)..(text_node.range().end + prefix);
+        output_size = output_size
+            .checked_sub(range.len() as u64)
+            .and_then(|size| size.checked_add(replacement.len() as u64))
+            .filter(|size| *size <= limits.max_metadata_bytes)
+            .ok_or_else(|| limit_error("rewritten SDF exceeds metadata byte limit"))?;
+        replacements.push((range, replacement));
     }
     drop(document);
     let mut output = text;
@@ -557,75 +744,179 @@ fn fix_model_paths(path: &Path, id: &Value) -> io::Result<()> {
     }
     fs::write(file, output)
 }
-fn cache_save_inner(a: &Value, data: &[u8]) -> io::Result<Value> {
-    let id = &a["id"];
-    let kind = s(a, "kind");
-    if !matches!(kind, "models" | "worlds")
-        || version(id) == 0
-        || !safe_relative(Path::new(s(id, "name")))
-        || !safe_relative(Path::new(s(id, "owner")))
-        || s(id, "name").contains('/')
-        || s(id, "owner").contains('/')
-    {
-        return Err(invalid("incomplete identifier"));
+fn read_text_limited(path: &Path, limit: u64) -> io::Result<String> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() > limit {
+        return Err(limit_error("metadata exceeds byte limit"));
     }
-    let relative = server_path(&id["server"]).ok_or_else(|| invalid("invalid server"))?;
-    let parent = Path::new(s(&a["config"], "cache_location"))
-        .join(relative)
-        .join(s(id, "owner"))
-        .join(kind)
-        .join(s(id, "name"));
-    let destination = parent.join(version(id).to_string());
-    no_symlinks(&destination)?;
-    if destination.exists() && !a["overwrite"].as_bool().unwrap_or(false) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "resource already cached",
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(limit_error("metadata exceeds byte limit"));
+    }
+    String::from_utf8(bytes).map_err(|error| invalid(&error.to_string()))
+}
+
+#[derive(Debug)]
+struct LimitExceeded(&'static str);
+impl std::fmt::Display for LimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+impl std::error::Error for LimitExceeded {}
+fn limit_error(message: &'static str) -> io::Error {
+    io::Error::other(LimitExceeded(message))
+}
+fn archive_failure(error: io::Error) -> Error {
+    let kind = if error
+        .get_ref()
+        .is_some_and(|source| source.is::<LimitExceeded>())
+    {
+        crate::ErrorKind::Limit
+    } else {
+        crate::ErrorKind::Io
+    };
+    Error::with_source(kind, error.to_string(), error)
+}
+
+/// Validate an archive in private staging, then atomically publish it while
+/// holding its resource publication lock across the resolved numeric install.
+pub(crate) fn save_resource<R: Read + Seek>(
+    config: &ClientConfig,
+    kind: ResourceKind,
+    id: &ResourceId,
+    reader: R,
+    overwrite: bool,
+) -> Result<CachedResource, Error> {
+    let id = cache_id(id, kind)?;
+    if id.version == 0 {
+        return Err(Error::new(
+            crate::ErrorKind::InvalidInput,
+            "cached versions must be resolved",
         ));
     }
+    let parent = resource_parent(config, kind, &id)?;
+    let destination = parent.join(id.version.to_string());
+    no_symlinks(&destination)?;
     fs::create_dir_all(&parent)?;
     let stage = tempfile::Builder::new()
         .prefix(".fuel-")
         .tempdir_in(&parent)?;
-    extract(Cursor::new(data), stage.path())?;
-    if kind == "models" {
-        fix_model_paths(stage.path(), id)?;
+    extract_with_limits(reader, stage.path(), &config.limits).map_err(archive_failure)?;
+    if kind == ResourceKind::Model {
+        let metadata = crate::metadata::validate(stage.path(), kind, &config.limits)?;
+        let file = metadata
+            .resource_file()
+            .ok_or_else(|| invalid("missing model SDF"))?;
+        fix_model_paths(stage.path(), &id, &config.limits, Path::new(&file.file))
+            .map_err(archive_failure)?;
+    } else {
+        let file = sdf_path_with_limits(stage.path(), &config.limits)
+            .map_err(archive_failure)?
+            .ok_or_else(|| invalid("world archive has no SDF"))?;
+        let text =
+            read_text_limited(&file, config.limits.max_metadata_bytes).map_err(archive_failure)?;
+        let document = roxmltree::Document::parse(text.trim_start()).map_err(|error| {
+            Error::with_source(crate::ErrorKind::Metadata, "invalid world SDF", error)
+        })?;
+        if !document.root_element().has_tag_name("sdf") {
+            return Err(Error::new(
+                crate::ErrorKind::Metadata,
+                "world SDF has no sdf root",
+            ));
+        }
+    }
+    // Validation and extraction deliberately precede lock acquisition so slow or
+    // invalid downloads do not block consumers of an already usable cache entry.
+    let _lock = resource_lock(&parent, id.version, true)?;
+    no_symlinks(&destination)?;
+    if destination.exists() && !overwrite {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "resource already cached").into());
     }
     install_stage(stage.path(), &destination)?;
-    let mut id = id.clone();
-    id["local_path"] = json!(destination.to_string_lossy());
-    Ok(json!({"ok":true,"id":id,"path":destination.to_string_lossy()}))
+    let path = fs::canonicalize(destination)?;
+    let mut id = id;
+    id.local_path = path.clone();
+    Ok(CachedResource { id, path })
 }
+
 fn install_stage(stage: &Path, destination: &Path) -> io::Result<()> {
     if !destination.exists() {
         return fs::rename(stage, destination);
     }
-    let parent = destination
-        .parent()
-        .ok_or_else(|| invalid("cache has no parent"))?;
-    let backup = tempfile::Builder::new()
-        .prefix(".fuel-backup-")
-        .tempdir_in(parent)?;
-    let previous = backup.path().join("previous");
-    fs::rename(destination, &previous)?;
-    if let Err(install_error) = fs::rename(stage, destination) {
-        if let Err(rollback_error) = fs::rename(&previous, destination) {
-            let retained = backup.keep();
-            return Err(io::Error::other(format!(
-                "cache installation failed: {install_error}; rollback failed: {rollback_error}; original retained at {}",
-                retained.display()
-            )));
-        }
-        return Err(install_error);
+    if !fs::symlink_metadata(destination)?.is_dir() {
+        return Err(invalid("cache destination is not a directory"));
     }
-    Ok(())
+    exchange_directories(stage, destination)
 }
+
+#[cfg(target_os = "linux")]
+fn exchange_directories(stage: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let stage = std::ffi::CString::new(stage.as_os_str().as_bytes())
+        .map_err(|_| invalid("invalid staging path"))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| invalid("invalid cache path"))?;
+    // SAFETY: both C strings remain live and NUL terminated throughout the call.
+    // AT_FDCWD makes their filesystem paths relative to this process as usual;
+    // RENAME_EXCHANGE atomically swaps the two existing directories without
+    // dereferencing Rust memory or giving ownership of either string to libc.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            stage.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem does not support atomic cache replacement",
+        ));
+    }
+    Err(error)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exchange_directories(_stage: &Path, _destination: &Path) -> io::Result<()> {
+    // Never fall back to rename-away/rename-in: it exposes missing resources and
+    // can lose the previous entry when rollback competes with another writer.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic cache replacement is unsupported on this platform",
+    ))
+}
+
 pub fn cache_save(a: &Value) -> Value {
     cache_save_bytes(a, &bytes(&a["data"]))
 }
 pub fn cache_save_bytes(a: &Value, data: &[u8]) -> Value {
-    cache_save_inner(a, data)
-        .unwrap_or_else(|e| json!({"ok":false,"id":a["id"],"path":"","error":e.to_string()}))
+    let result = (|| {
+        let kind = kind_from_value(a).ok_or_else(|| invalid("invalid resource kind"))?;
+        let config = crate::core::typed_config(&a["config"])?;
+        let id = serde_json::from_value::<ResourceId>(a["id"].clone())?;
+        save_resource(
+            &config,
+            kind,
+            &id,
+            Cursor::new(data),
+            a["overwrite"].as_bool().unwrap_or(false),
+        )
+    })();
+    match result {
+        Ok(entry) => json!({"ok":true,"id":entry.id,"path":entry.path}),
+        Err(error) => json!({"ok":false,"id":a["id"],"path":"","error":error.to_string()}),
+    }
 }
 pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
     Some(match op {
@@ -650,8 +941,10 @@ pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::{join_url, mime};
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -885,7 +1178,7 @@ mod tests {
             ("tga", "image/tga"),
             ("txt", "text/plain"),
         ] {
-            assert_eq!(mime(&format!("file.{extension}")), expected);
+            assert_eq!(mime(format!("file.{extension}")), expected);
         }
     }
     #[test]
@@ -1000,7 +1293,7 @@ mod tests {
         let packed = archive(&[
             (
                 "model.config",
-                b"<model><sdf version='1.9'>model.sdf</sdf></model>",
+                b"<model><name>box</name><sdf version='1.9'>model.sdf</sdf></model>",
             ),
             ("model.sdf", sdf),
             ("a.png", &[0, 255, 10, 13]),
@@ -1085,8 +1378,11 @@ mod tests {
             "good"
         );
         let packed = archive(&[
-            ("metadata.pbtxt", b"model { file: \"model.sdf\" }"),
-            ("model.sdf", b"<sdf/>"),
+            (
+                "metadata.pbtxt",
+                b"name: \"box\" model { file: \"model.sdf\" }",
+            ),
+            ("model.sdf", b"<sdf><model name='box'/></sdf>"),
         ]);
         let configuration = config(root.path());
         let saved =
@@ -1208,7 +1504,7 @@ mod tests {
     #[test]
     fn legacy_xml_declarations_allow_leading_whitespace() {
         let temp = tempfile::tempdir().unwrap();
-        let payload=archive(&[("model.config",b"\n<?xml version='1.0'?><model><name>Box</name><sdf version='1.6'> model.sdf </sdf></model>"),("model.sdf",b"\n<?xml version='1.0'?><sdf><model><uri>model://box/mesh.dae</uri></model></sdf>")]);
+        let payload=archive(&[("model.config",b"\n<?xml version='1.0'?><model><name>Box</name><sdf version='1.6'> model.sdf </sdf></model>"),("model.sdf",b"\n<?xml version='1.0'?><sdf><model name='box'><uri>model://box/mesh.dae</uri></model></sdf>")]);
         let saved = cache_save_bytes(
             &json!({"config":config(temp.path()),"id":id(),"kind":"models","overwrite":true}),
             &payload,
@@ -1221,3 +1517,7 @@ mod tests {
         assert!(text.contains("/files/mesh.dae"));
     }
 }
+
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod cache_tests;

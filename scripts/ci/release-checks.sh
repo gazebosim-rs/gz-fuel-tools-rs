@@ -54,32 +54,11 @@ export PKG_CONFIG_PATH="$work/relocated/$libdir/pkgconfig${PKG_CONFIG_PATH:+:$PK
 export LD_LIBRARY_PATH="$work/relocated/$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 test "$("$work/relocated/bin/gz-fuel" --versions)" = "${version/-pre./~pre}"
 "$work/relocated/bin/gz-fuel" --help > /dev/null
-mkdir "$work/consumer"
-cat > "$work/consumer/main.cc" <<'CPP'
-#include <gz/fuel_tools.hh>
-#include <string>
-static_assert(GZ_FUEL_TOOLS_MAJOR_VERSION == EXPECTED_MAJOR);
-int main()
-{
-  gz::fuel_tools::ClientConfig config;
-  gz::fuel_tools::FuelClient client(config);
-  return client.Config().UserAgent() ==
-    std::string("GazeboFuelTools-") + GZ_FUEL_TOOLS_VERSION_FULL ? 0 : 1;
-}
-CPP
-cat > "$work/consumer/CMakeLists.txt" <<'CMAKE'
-cmake_minimum_required(VERSION 3.22)
-project(fuel_external_consumer LANGUAGES CXX)
-find_package(gz-fuel_tools ${EXPECTED_MAJOR} REQUIRED)
-add_executable(consumer_cmake main.cc)
-target_compile_features(consumer_cmake PRIVATE cxx_std_17)
-target_compile_definitions(consumer_cmake PRIVATE EXPECTED_MAJOR=${EXPECTED_MAJOR})
-target_link_libraries(consumer_cmake PRIVATE gz-fuel_tools::gz-fuel_tools)
-CMAKE
+cp -R tests/install_consumer "$work/consumer"
 cmake -S "$work/consumer" -B "$work/consumer-build" \
-  -DCMAKE_PREFIX_PATH="$work/relocated" -DEXPECTED_MAJOR="$major"
+  -DCMAKE_PREFIX_PATH="$work/relocated" -DEXPECTED_MAJOR="$major" -DEXPECTED_PREFIX="$work/relocated"
 cmake --build "$work/consumer-build" --parallel "$jobs"
-"$work/consumer-build/consumer_cmake"
+ctest --test-dir "$work/consumer-build" --output-on-failure
 python3 - "$work/consumer/main.cc" "$work/consumer-build/consumer_pkgconfig" "$major" <<'PY'
 import os
 import shlex

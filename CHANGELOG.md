@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Resolve all seventeen findings from the clean-context rewrite review; retain
+  unchanged upstream C++ declarations and tests.
+- Replace native JSON dispatch with typed domain operations, structured failures,
+  shared identity rules and one bounded Rust/CLI/C++ pagination state machine.
+- Validate metadata/SDF before atomic cache publication, coordinate processes,
+  retain legacy read-only and mixed-case caches, and reject incomplete archives.
+- Stream multipart files and archive downloads, share pooled HTTP clients, pass
+  C++ binary bodies independently of JSON, and configure finite work/time limits.
+- Preserve sparse patch privacy, configured URL credentials, collection spelling,
+  encoded asset URLs, checked C++ numeric conversions and non-UTF8 native roots.
+- Parse the complete upstream protobuf schema and verify it against protoc; restore
+  CMake aliases/variables and test seven relocated consumer configurations.
+- Upgrade Tokio to a patched version without advisory exceptions.
+
 - Keep upload metadata literal and scope dependency download credentials to their
   intended origin; cover both behaviors with local regression servers.
 - Traverse cached dependencies to fetch missing descendants, and report listing

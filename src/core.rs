@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Compatibility value semantics, configuration and Fuel JSON codecs.
 use serde_json::{Value, json};
-use std::{env, fs, path::Path};
+#[cfg(test)]
+use std::fs;
+use std::{env, path::Path};
 
 pub fn server_default() -> Value {
     json!({"url":"https://fuel.gazebosim.org","version":"1.0","api_key":""})
@@ -16,26 +18,8 @@ pub fn s<'a>(v: &'a Value, key: &str) -> &'a str {
 fn sanitize(v: &str) -> String {
     v.replace(':', "%3A").replace('@', "%40")
 }
-fn home_cache() -> String {
-    Path::new(&env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default())
-        .join(".gz/fuel")
-        .to_string_lossy()
-        .into_owned()
-}
 fn config_default() -> Value {
-    let mut c = json!({"servers":[server_default()],"cache_location":home_cache(),"config_path":"","user_agent":"GazeboFuelTools-12.0.0~pre2"});
-    if let Ok(p) = env::var("GZ_FUEL_CACHE_PATH") {
-        if !p.is_empty() && Path::new(&p).is_dir() {
-            c["cache_location"] = json!(p);
-        }
-        for name in ["config.yaml", "config.yml"] {
-            let file = Path::new(s(&c, "cache_location")).join(name);
-            if file.exists() {
-                return config_load(&c, &file.to_string_lossy())["config"].clone();
-            }
-        }
-    }
-    c
+    config_value(&default_config())
 }
 fn join(parts: &[&str]) -> String {
     let mut out = String::new();
@@ -163,52 +147,18 @@ fn id_format(id: &Value, kind: &str, p: &str, pretty: bool) -> String {
     out
 }
 fn config_load(c: &Value, path: &str) -> Value {
-    let Ok(content) = fs::read_to_string(path) else {
-        return json!({"ok":false,"config":c});
-    };
-    let mut c = c.clone();
-    c["config_path"] = json!(path);
-    let Ok(doc) = serde_saphyr::from_str::<Value>(&content) else {
-        return json!({"ok":false,"config":c});
-    };
-    let mut ok = true;
-    if let Some(list) = doc["servers"].as_array() {
-        for srv in list {
-            let url = s(srv, "url");
-            if url.is_empty() {
-                ok = false;
-                continue;
+    let current = serde_json::from_value::<crate::ClientConfig>(c.clone())
+        .unwrap_or_else(|_| default_config());
+    match load_config(&current, Path::new(path)) {
+        Ok(config) => json!({"ok":true,"config":config_value(&config)}),
+        Err(_) => {
+            let mut unchanged = c.clone();
+            if Path::new(path).is_file() {
+                unchanged["config_path"] = json!(path);
             }
-            let token = s(srv, "private-token");
-            let servers = c["servers"]
-                .as_array_mut()
-                .expect("configuration has servers");
-            if let Some(old) = servers.iter_mut().find(|v| s(v, "url") == url) {
-                if !token.is_empty() {
-                    old["api_key"] = json!(token);
-                }
-            } else {
-                let mut new = server_default();
-                new["url"] = json!(url);
-                new["has_authority"] = json!(false);
-                new["api_key"] = json!(token);
-                servers.push(new);
-            }
+            json!({"ok":false,"config":unchanged})
         }
     }
-    let configured = s(&doc["cache"], "path");
-    if doc.get("cache").is_some() && configured.is_empty() {
-        ok = false;
-    }
-    c["cache_location"] =
-        json!(
-            env::var("GZ_FUEL_CACHE_PATH").unwrap_or_else(|_| if configured.is_empty() {
-                home_cache()
-            } else {
-                configured.into()
-            })
-        );
-    json!({"ok":ok,"config":c})
 }
 fn parse_json(text: &str) -> Value {
     serde_json::from_str(text)
@@ -227,41 +177,59 @@ fn date(t: &str) -> i64 {
         .map(|d| d.timestamp())
         .unwrap_or(0)
 }
-fn parse_id(v: &Value, server: &Value, kind: &str) -> Option<Value> {
+fn legacy_u32(value: &Value) -> Option<u32> {
+    match value {
+        Value::Null => Some(0),
+        Value::Bool(value) => Some(u32::from(*value)),
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                u32::try_from(value).ok()
+            } else {
+                let value = number.as_f64()?;
+                (value >= 0.0 && value <= u32::MAX as f64).then_some(value as u32)
+            }
+        }
+        _ => None,
+    }
+}
+fn parse_id_fields(v: &Value, id: &mut Value, kind: &str) -> Option<()> {
     v.as_object()?;
-    let mut id = id_default();
-    id["server"] = server.clone();
-    for k in ["name", "owner"] {
-        if let Some(x) = v[k].as_str() {
-            id[k] = json!(x.to_ascii_lowercase());
+    for field in ["name", "owner"] {
+        if let Some(text) = v[field].as_str() {
+            id[field] = json!(if kind == "collections" {
+                text.to_owned()
+            } else {
+                text.to_ascii_lowercase()
+            });
         }
     }
-    if let Some(n) = v["version"].as_u64() {
-        id["version"] = json!(n);
-    }
     if kind == "models" {
+        for (from, to) in [("updatedAt", "modify_date"), ("createdAt", "upload_date")] {
+            if let Some(text) = v[from].as_str() {
+                id[to] = json!(date(text));
+            }
+        }
+        if let Some(text) = v["description"].as_str() {
+            id["description"] = json!(text);
+        }
+        // Match upstream's mutation order. Scalar parsing exposes fields assigned
+        // before a numeric error; array parsing omits that failed record entirely.
         for (from, to) in [
-            ("description", "description"),
+            ("likes", "like_count"),
+            ("downloads", "download_count"),
+            ("filesize", "file_size"),
+        ] {
+            if let Some(number) = v.get(from) {
+                id[to] = json!(legacy_u32(number)?);
+            }
+        }
+        for (from, to) in [
             ("license_name", "license_name"),
             ("license_url", "license_url"),
             ("license_image", "license_image_url"),
         ] {
-            if let Some(x) = v[from].as_str() {
-                id[to] = json!(x);
-            }
-        }
-        for (from, to) in [
-            ("filesize", "file_size"),
-            ("likes", "like_count"),
-            ("downloads", "download_count"),
-        ] {
-            if let Some(n) = v[from].as_u64() {
-                id[to] = json!(n);
-            }
-        }
-        for (from, to) in [("createdAt", "upload_date"), ("updatedAt", "modify_date")] {
-            if let Some(t) = v[from].as_str() {
-                id[to] = json!(date(t));
+            if let Some(text) = v[from].as_str() {
+                id[to] = json!(text);
             }
         }
         if let Some(tags) = v["tags"].as_array()
@@ -270,6 +238,18 @@ fn parse_id(v: &Value, server: &Value, kind: &str) -> Option<Value> {
             id["tags"] = json!(tags);
         }
     }
+    if let Some(version) = v.get("version") {
+        id["version"] = json!(legacy_u32(version)?);
+    }
+    if let Some(private) = v["private"].as_bool() {
+        id["private"] = json!(private);
+    }
+    Some(())
+}
+fn parse_id(v: &Value, server: &Value, kind: &str) -> Option<Value> {
+    let mut id = id_default();
+    id["server"] = server.clone();
+    parse_id_fields(v, &mut id, kind)?;
     Some(id)
 }
 pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
@@ -378,11 +358,10 @@ pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
                     .collect();
                 json!(ids)
             } else {
-                parse_id(&v, &a["server"], s(a, "kind")).unwrap_or_else(|| {
-                    let mut id = id_default();
-                    id["server"] = a["server"].clone();
-                    id
-                })
+                let mut id = id_default();
+                id["server"] = a["server"].clone();
+                let _ = parse_id_fields(&v, &mut id, s(a, "kind"));
+                id
             }
         }
         "json_build" => {
@@ -406,7 +385,7 @@ pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
                 for l in list {
                     if l.is_object() {
                         let n = s(l, "name");
-                        if let Some(id) = l["ID"].as_u64() {
+                        if let Some(id) = legacy_u32(&l["ID"]) {
                             licenses.entry(n).or_insert(json!(id));
                         }
                     }
@@ -418,12 +397,255 @@ pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
     })
 }
 
+const USER_AGENT: &str = "GazeboFuelTools-12.0.0~pre2";
+/// Native defaults retain filesystem paths without a JSON/string conversion.
+pub(crate) fn default_config() -> crate::ClientConfig {
+    let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+    let mut config = crate::ClientConfig {
+        servers: vec![crate::ServerConfig::default()],
+        cache_location: std::path::PathBuf::from(home).join(".gz/fuel"),
+        config_path: std::path::PathBuf::new(),
+        user_agent: USER_AGENT.into(),
+        limits: crate::ResourceLimits::default(),
+    };
+    if let Some(path) = env::var_os("GZ_FUEL_CACHE_PATH") {
+        if !path.is_empty() && Path::new(&path).is_dir() {
+            config.cache_location = path.into();
+        }
+        for name in ["config.yaml", "config.yml"] {
+            let path = config.cache_location.join(name);
+            if path.is_file() {
+                if let Ok(loaded) = load_config(&config, &path) {
+                    return loaded;
+                }
+                break;
+            }
+        }
+    }
+    config
+}
+/// Parse YAML and merge only after the complete configuration has validated.
+pub(crate) fn load_config(
+    current: &crate::ClientConfig,
+    path: &Path,
+) -> Result<crate::ClientConfig, crate::Error> {
+    use crate::{Error, ErrorKind};
+    #[derive(serde::Deserialize)]
+    struct Server {
+        url: String,
+        #[serde(default, rename = "private-token")]
+        token: String,
+        #[serde(default)]
+        version: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Cache {
+        path: std::path::PathBuf,
+    }
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct Configuration {
+        servers: Vec<Server>,
+        #[serde(default, deserialize_with = "cache_setting")]
+        cache: Option<Cache>,
+        limits: Option<crate::ResourceLimits>,
+    }
+    fn cache_setting<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Cache>, D::Error> {
+        <Cache as serde::Deserialize>::deserialize(deserializer).map(Some)
+    }
+    let text = crate::metadata::read_text(path, current.limits.max_metadata_bytes)?;
+    let settings: Configuration = serde_saphyr::from_str(&text).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid Fuel YAML configuration: {error}"),
+        )
+    })?;
+    let mut output = current.clone();
+    for server in settings.servers {
+        let parsed = url::Url::parse(&server.url).map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "Invalid Fuel server URL in configuration",
+            )
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Invalid Fuel server URL in configuration",
+            ));
+        }
+        if let Some(old) = output
+            .servers
+            .iter_mut()
+            .find(|old| old.url.trim_end_matches('/') == server.url.trim_end_matches('/'))
+        {
+            if !server.token.is_empty() {
+                old.api_key = server.token;
+            }
+            if let Some(version) = server.version {
+                if !crate::identity::component(&version) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "Invalid Fuel API version",
+                    ));
+                }
+                old.version = version;
+            }
+        } else {
+            let version = server.version.unwrap_or_else(|| "1.0".into());
+            if !crate::identity::component(&version) {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Invalid Fuel API version",
+                ));
+            }
+            output.servers.push(crate::ServerConfig {
+                url: server.url,
+                api_key: server.token,
+                version,
+                has_authority: false,
+            });
+        }
+    }
+    output.cache_location =
+        if let Some(cache) = env::var_os("GZ_FUEL_CACHE_PATH").filter(|path| !path.is_empty()) {
+            cache.into()
+        } else if let Some(cache) = settings.cache {
+            if cache.path.as_os_str().is_empty() {
+                return Err(Error::new(ErrorKind::InvalidInput, "Empty Fuel cache path"));
+            }
+            cache.path
+        } else {
+            std::path::PathBuf::from(
+                env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default(),
+            )
+            .join(".gz/fuel")
+        };
+    if let Some(limits) = settings.limits {
+        output.limits = limits;
+    }
+    output.config_path = path.to_owned();
+    Ok(output)
+}
+fn config_value(config: &crate::ClientConfig) -> Value {
+    json!({"servers":config.servers,"cache_location":config.cache_location.to_string_lossy(),"config_path":config.config_path.to_string_lossy(),"user_agent":config.user_agent,"limits":config.limits})
+}
+/// Decode a legacy configuration and recover budget settings hidden by retained C++ getters.
+pub(crate) fn typed_config(value: &Value) -> Result<crate::ClientConfig, crate::Error> {
+    if value.is_null() {
+        return Ok(default_config());
+    }
+    if !value.is_object() {
+        return Err(crate::Error::new(
+            crate::ErrorKind::InvalidInput,
+            "Invalid Fuel configuration object",
+        ));
+    }
+    let mut config: crate::ClientConfig = serde_json::from_value(value.clone())?;
+    if value.get("limits").is_none() && !config.config_path.as_os_str().is_empty() {
+        #[derive(Default, serde::Deserialize)]
+        #[serde(default)]
+        struct LimitsOnly {
+            limits: Option<crate::ResourceLimits>,
+        }
+        let text =
+            crate::metadata::read_text(&config.config_path, config.limits.max_metadata_bytes)?;
+        let loaded: LimitsOnly = serde_saphyr::from_str(&text).map_err(|error| {
+            crate::Error::new(
+                crate::ErrorKind::InvalidInput,
+                format!("Invalid Fuel resource limits: {error}"),
+            )
+        })?;
+        if let Some(limits) = loaded.limits {
+            config.limits = limits;
+        }
+    }
+    Ok(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn run(op: &str, a: Value) -> Value {
         dispatch(op, &a).unwrap()
     }
+    #[test]
+    fn configuration_limits_and_hidden_legacy_settings_are_retained() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("config.yaml");
+        fs::write(&path,"servers:\n - url: https://example.com\n   private-token: first\n   version: '2.0'\nlimits:\n max_dependency_resources: 3\n max_pages: 2\n").unwrap();
+        let configured = load_config(&default_config(), &path).unwrap();
+        assert_eq!(configured.limits.max_pages, 2);
+        assert_eq!(configured.servers.last().unwrap().version, "2.0");
+        let mut legacy = config_value(&configured);
+        legacy.as_object_mut().unwrap().remove("limits");
+        assert_eq!(
+            typed_config(&legacy)
+                .unwrap()
+                .limits
+                .max_dependency_resources,
+            3
+        );
+        fs::write(&path, "limits:\n max_pages: invalid\n").unwrap();
+        assert!(typed_config(&legacy).is_err());
+        for source in [
+            "servers:\n - url: ftp://host\n",
+            "servers:\n - url: bad\n",
+            "servers:\n - url: https://example.com\n   version: ../bad\n",
+            "servers:\n - url: https://fuel.gazebosim.org\n   version: ../bad\n",
+            "cache:\n path: ''\n",
+            "cache: null\n",
+        ] {
+            fs::write(&path, source).unwrap();
+            assert!(load_config(&configured, &path).is_err(), "{source}");
+        }
+        fs::write(&path,"servers:\n - url: https://fuel.gazebosim.org\n   private-token: replacement\n   version: '3.0'\n").unwrap();
+        let merged = load_config(&configured, &path).unwrap();
+        assert_eq!(merged.servers[0].api_key, "replacement");
+        assert_eq!(merged.servers[0].version, "3.0");
+    }
+    #[test]
+    fn legacy_json_stops_before_overflow_and_preserves_collection_case_privacy() {
+        for field in ["version", "filesize", "likes", "downloads"] {
+            let mut invalid = json!({"name":"bad","owner":"a"});
+            invalid[field] = json!(u64::from(u32::MAX) + 1);
+            let text = json!([{"name":"first","owner":"a"},invalid,{"name":"later","owner":"a"}])
+                .to_string();
+            let values = run(
+                "json_parse",
+                json!({"text":text,"server":server_default(),"kind":"models","many":true}),
+            );
+            assert_eq!(values.as_array().unwrap().len(), 1, "{field}");
+            let partial = run(
+                "json_parse",
+                json!({"text":invalid.to_string(),"server":server_default(),"kind":"models"}),
+            );
+            assert_eq!(partial["name"], "bad");
+            assert_eq!(partial["owner"], "a");
+        }
+        let licenses = run(
+            "json_licenses",
+            json!({"text":r#"[{"name":"first","ID":2},{"name":"overflow","ID":4294967296},{"name":"last","ID":4}]"#}),
+        );
+        assert_eq!(licenses["ok"], true);
+        assert_eq!(licenses["licenses"], json!({"first":2,"last":4}));
+        let value = parse_id(
+            &json!({"name":"MyCollection","owner":"OpenRobotics","private":true}),
+            &server_default(),
+            "collections",
+        )
+        .unwrap();
+        assert_eq!(value["name"], "MyCollection");
+        assert_eq!(value["owner"], "OpenRobotics");
+        assert_eq!(value["private"], true);
+    }
+
     #[test]
     fn identifier_semantics_and_version_errors() {
         let id = id_default();
@@ -636,7 +858,11 @@ mod tests {
         }
         assert_eq!(date("bad date"), 0);
         let bad = json!({"tags":[1],"name":1,"version":"bad"});
-        let r = parse_id(&bad, &server, "models").unwrap();
+        assert!(parse_id(&bad, &server, "models").is_none());
+        let r = run(
+            "json_parse",
+            json!({"text":bad.to_string(),"server":server,"kind":"models"}),
+        );
         assert_eq!(r["tags"], json!([]));
         let text = r#"[{"name":"CC0","ID":1},{"name":"CC0","ID":2},null,{"name":"broken"}]"#;
         let r = run("json_licenses", json!({"text":text}));

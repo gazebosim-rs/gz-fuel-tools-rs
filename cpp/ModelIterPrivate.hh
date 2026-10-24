@@ -19,9 +19,11 @@
 #define GZ_FUEL_TOOLS_MODELITERPRIVATE_HH_
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "Pager.hh"
 #include "gz/fuel_tools/Model.hh"
 #include "gz/fuel_tools/ModelIdentifier.hh"
 #include "gz/fuel_tools/RestClient.hh"
@@ -184,6 +186,9 @@ class GZ_FUEL_TOOLS_HIDDEN IterRestIds : public ModelIterPrivate {
   /// server.
  protected:
   std::size_t currentPage{0};
+
+ protected:
+  std::unique_ptr<rs::Pager> pager;
 };
 }  // namespace gz::fuel_tools
 

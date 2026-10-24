@@ -31,7 +31,9 @@ A small C ABI transfers length-safe JSON messages between Rust and C++ facade
 implementations. This internal ABI is not the consumer API. Existing C++ headers
 remain the consumer contract; C++ adapts Gazebo URI types, containers, virtual
 interfaces, iterator handles and stable reference returns. All substantive Fuel
-algorithms belong in Rust. Binary data travels as byte arrays, never lossy text.
+algorithms belong in Rust. Binary data travels as owned length-delimited byte buffers, never lossy text.
+The review follow-up replaces native JSON dispatch with typed domain operations;
+see REVIEW_FIX_PLAN.md for the full correction and acceptance matrix.
 The C++ facade links the Rust static library, never the original Fuel library.
 
 ## Work sequence

@@ -1,12 +1,10 @@
 // Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 //! Typed native Rust API. No Gazebo C++ dependencies are required.
+pub use crate::error::{Error, ErrorKind};
+pub use crate::policy::ResourceLimits;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 /// Fuel resource category used to select an API route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,9 +29,9 @@ impl ResourceKind {
 /// Fuel endpoint and its credentials.
 ///
 /// Defaults to `https://fuel.gazebosim.org`, API version `1.0`, an empty API
-/// key, and authority-aware cache naming. This type contains credentials; avoid
-/// logging its debug or serialized representation when a key is present.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// key, and authority-aware cache naming. Debug output redacts its private token;
+/// serialized representations contain credentials and must be kept private.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
     /// Server base URL, without the API-version or resource route segments.
@@ -46,6 +44,17 @@ pub struct ServerConfig {
     ///
     /// This preserves the legacy C++ URI parser's authority/path distinction.
     pub has_authority: bool,
+}
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerConfig")
+            .field("url", &self.url)
+            .field("version", &self.version)
+            .field("api_key", &"[redacted]")
+            .field("has_authority", &self.has_authority)
+            .finish()
+    }
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -75,17 +84,12 @@ pub struct ClientConfig {
     pub user_agent: String,
     /// Loaded YAML configuration path, or an empty path when none has been loaded.
     pub config_path: PathBuf,
+    /// Finite resource budgets and configurable network timeouts.
+    pub limits: ResourceLimits,
 }
 impl Default for ClientConfig {
     fn default() -> Self {
-        let v =
-            crate::core::dispatch("config_default", &json!({})).expect("default config operation");
-        Self {
-            servers: serde_json::from_value(v["servers"].clone()).expect("default servers"),
-            cache_location: v["cache_location"].as_str().unwrap_or("").into(),
-            user_agent: v["user_agent"].as_str().unwrap_or("").into(),
-            config_path: v["config_path"].as_str().unwrap_or("").into(),
-        }
+        crate::core::default_config()
     }
 }
 impl ClientConfig {
@@ -99,13 +103,7 @@ impl ClientConfig {
     /// Returns an error for an unreadable file, invalid YAML, invalid server/cache
     /// settings, or settings that cannot be represented by this typed API.
     pub fn load(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
-        let out =
-            crate::core::dispatch("config_load", &json!({"config":self,"path":path.as_ref()}))
-                .unwrap();
-        if out["ok"] != true {
-            return Err(Error("Invalid Fuel configuration".into()));
-        }
-        *self = serde_json::from_value(out["config"].clone()).map_err(|e| Error(e.to_string()))?;
+        *self = crate::core::load_config(self, path.as_ref())?;
         Ok(())
     }
 }
@@ -177,36 +175,11 @@ impl ResourceId {
     /// API and resource version segments are not appended. Returns an empty string
     /// if the server URL cannot be parsed or cannot contain path segments.
     pub fn url(&self, kind: ResourceKind) -> String {
-        let Ok(mut url) = url::Url::parse(&self.server.url) else {
-            return String::new();
-        };
-        let Ok(mut segments) = url.path_segments_mut() else {
-            return String::new();
-        };
-        segments.pop_if_empty();
-        if !self.owner.is_empty() {
-            segments.push(&self.owner);
-        }
-        segments.push(kind.route());
-        if !self.name.is_empty() {
-            segments.push(&self.name);
-        }
-        drop(segments);
-        url.into()
+        crate::identity::resource_url(self, kind, false, false)
+            .map(|url| url.to_string())
+            .unwrap_or_default()
     }
 }
-/// A Fuel operation failure, including transport, decoding, or cache failures.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Error(
-    /// Human-readable diagnostic; callers should not depend on exact wording.
-    pub String,
-);
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for Error {}
 /// A successfully installed resource and its direct model dependencies.
 #[derive(Clone, Debug)]
 pub struct Downloaded {
@@ -243,24 +216,6 @@ impl FuelClient {
     pub fn new(config: ClientConfig) -> Self {
         Self { config }
     }
-    fn args(&self, kind: ResourceKind, id: &ResourceId, headers: &[String]) -> Value {
-        json!({"config":self.config,"kind":kind.route(),"id":id,"headers":headers})
-    }
-    fn invoke(&self, op: &str, a: &Value) -> Result<Value, Error> {
-        let value = crate::execute(op, a).map_err(Error)?;
-        if let Some(code) = value["result"].as_u64()
-            && ![1, 4, 5, 8, 12].contains(&code)
-        {
-            let r = crate::core::dispatch("result", &json!({"type":code})).unwrap();
-            return Err(Error(
-                r["message"]
-                    .as_str()
-                    .unwrap_or("Fuel request failed")
-                    .to_owned(),
-            ));
-        }
-        Ok(value)
-    }
     /// Parse a resource URL without fetching it.
     ///
     /// Matching configured servers supply their API version and credentials.
@@ -271,9 +226,7 @@ impl FuelClient {
     /// Returns an error for malformed URLs, mismatched resource kinds, unsafe path
     /// components, or invalid numeric resource versions.
     pub fn parse(&self, url: &str, kind: ResourceKind) -> Result<ResourceId, Error> {
-        let parsed = crate::client::parse_url(url, &json!(self.config), kind.route(), false)
-            .ok_or_else(|| Error("Invalid Fuel URL".into()))?;
-        serde_json::from_value(parsed["id"].clone()).map_err(|e| Error(e.to_string()))
+        crate::identity::parse(url, &self.config, kind, false).map(|parsed| parsed.id)
     }
     /// Fetch server metadata for a model or world.
     ///
@@ -285,8 +238,7 @@ impl FuelClient {
         id: &ResourceId,
         headers: &[String],
     ) -> Result<ResourceId, Error> {
-        let v = self.invoke("client.details", &self.args(kind, id, headers))?;
-        serde_json::from_value(v["id"].clone()).map_err(|e| Error(e.to_string()))
+        crate::client::ClientCore::new(&self.config).details(kind, id, headers)
     }
     /// Download and install a model or world in the configured cache.
     ///
@@ -304,8 +256,7 @@ impl FuelClient {
         id: &ResourceId,
         headers: &[String],
     ) -> Result<Downloaded, Error> {
-        let v = self.invoke("client.download", &self.args(kind, id, headers))?;
-        decode_download(&v)
+        crate::client::ClientCore::new(&self.config).download(kind, id, headers)
     }
     /// Read model dependencies from local cached metadata without downloading them.
     ///
@@ -315,21 +266,17 @@ impl FuelClient {
     /// # Errors
     /// Returns an error when existing dependency metadata cannot be read or parsed.
     pub fn dependencies(&self, id: &ResourceId, recursive: bool) -> Result<Vec<ResourceId>, Error> {
-        let mut a = self.args(ResourceKind::Model, id, &[]);
-        a["recursive"] = json!(recursive);
-        let v = self.invoke("client.dependencies", &a)?;
-        serde_json::from_value(v["dependencies"].clone()).map_err(|e| Error(e.to_string()))
+        crate::client::ClientCore::new(&self.config).dependencies(id, recursive)
     }
     /// Find a cached model/world version without a network request.
     ///
     /// Version zero selects the highest numeric cached version; other versions
     /// require an exact match. Returns `None` if no usable entry is found.
     pub fn cached(&self, kind: ResourceKind, id: &ResourceId) -> Option<PathBuf> {
-        let mut a = self.args(kind, id, &[]);
-        a["exact"] = json!(true);
-        crate::io::dispatch("io.cache_list", &a)?[0]["path"]
-            .as_str()
-            .map(Into::into)
+        crate::io::lookup_resource(&self.config, kind, id)
+            .ok()
+            .flatten()
+            .map(|cached| cached.path)
     }
     /// Enumerate cached versions, optionally matching an identifier's set fields.
     ///
@@ -340,22 +287,7 @@ impl FuelClient {
         kind: ResourceKind,
         filter: Option<&ResourceId>,
     ) -> Vec<CachedResource> {
-        let mut args = json!({"config":self.config,"kind":kind.route()});
-        if let Some(id) = filter {
-            args["id"] = json!(id);
-        }
-        let entries = crate::io::cache_list(&args);
-        entries
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                Some(CachedResource {
-                    id: serde_json::from_value(entry["id"].clone()).ok()?,
-                    path: entry["path"].as_str()?.into(),
-                })
-            })
-            .collect()
+        crate::io::cached_resources(&self.config, kind, filter).unwrap_or_default()
     }
     /// List models or worlds belonging to a Fuel collection, lazily by page.
     ///
@@ -366,14 +298,13 @@ impl FuelClient {
             .remove(b'_')
             .remove(b'.')
             .remove(b'~');
-        let mut iterator = self.list(kind, &collection.server, None);
-        iterator.args["path"] = json!(format!(
+        let path = format!(
             "{}/collections/{}/{}",
             percent_encoding::utf8_percent_encode(&collection.owner, SEGMENT),
             percent_encoding::utf8_percent_encode(&collection.name, SEGMENT),
             kind.route()
-        ));
-        iterator
+        );
+        ResourceIter::new(self.config.clone(), kind, collection.server.clone(), path)
     }
     /// Resolve a model/world resource or `/files/` URL to a cached local path.
     ///
@@ -384,11 +315,7 @@ impl FuelClient {
     /// Returns an error if the URL is invalid, downloading fails, or the requested
     /// cached file is missing or would escape its resource directory.
     pub fn fetch(&self, url: &str) -> Result<PathBuf, Error> {
-        let v = self.invoke("client.fetch", &json!({"config":self.config,"url":url}))?;
-        v.as_str()
-            .filter(|p| !p.is_empty())
-            .map(Into::into)
-            .ok_or_else(|| Error("Unable to fetch Fuel resource".into()))
+        crate::client::ClientCore::new(&self.config).fetch(url)
     }
     /// Upload a model directory and its metadata to `id.server`.
     ///
@@ -406,11 +333,13 @@ impl FuelClient {
         private: bool,
         owner: &str,
     ) -> Result<(), Error> {
-        let mut a = self.args(ResourceKind::Model, id, headers);
-        a["path"] = json!(path.as_ref());
-        a["private"] = json!(private);
-        a["owner"] = json!(owner);
-        self.invoke("client.upload", &a).map(|_| ())
+        crate::client::ClientCore::new(&self.config).upload(
+            path.as_ref(),
+            id,
+            headers,
+            private,
+            owner,
+        )
     }
     /// Patch an existing model using `id.private` and `id.owner`.
     ///
@@ -425,11 +354,7 @@ impl FuelClient {
         headers: &[String],
         path: Option<&Path>,
     ) -> Result<(), Error> {
-        let mut a = self.args(ResourceKind::Model, id, headers);
-        a["path"] = json!(path.unwrap_or(Path::new("")));
-        a["private"] = json!(id.private);
-        a["owner"] = json!(id.owner);
-        self.invoke("client.patch", &a).map(|_| ())
+        crate::client::ClientCore::new(&self.config).patch(id, headers, path)
     }
     /// Delete a remote model or world; this does not remove local cache entries.
     ///
@@ -441,8 +366,7 @@ impl FuelClient {
         id: &ResourceId,
         headers: &[String],
     ) -> Result<(), Error> {
-        self.invoke("client.delete", &self.args(kind, id, headers))
-            .map(|_| ())
+        crate::client::ClientCore::new(&self.config).delete(kind, id, headers)
     }
     /// Check cached models/worlds for newer versions and download available updates.
     ///
@@ -450,15 +374,7 @@ impl FuelClient {
     /// Returns an error if any metadata request or download fails. Other resources
     /// may have been updated successfully before the error is returned.
     pub fn update(&self, kind: ResourceKind, headers: &[String]) -> Result<(), Error> {
-        let v = self.invoke(
-            "client.update",
-            &json!({"kind":kind.route(),"config":self.config,"headers":headers}),
-        )?;
-        if v == true {
-            Ok(())
-        } else {
-            Err(Error("Some Fuel resources could not be updated".into()))
-        }
+        crate::client::ClientCore::new(&self.config).update(kind, headers)
     }
     /// Create a lazy remote listing, optionally restricted to one owner.
     ///
@@ -485,15 +401,7 @@ impl FuelClient {
                 )
             })
             .unwrap_or_else(|| kind.route().to_owned());
-        ResourceIter {
-            args: json!({"server":server,"kind":kind.route(),"path":path,"path_encoded":true,"user_agent":self.config.user_agent}),
-            page: 0,
-            items: vec![].into_iter(),
-            previous: Value::Null,
-            done: false,
-            received: 0,
-            total: None,
-        }
+        ResourceIter::new(self.config.clone(), kind, server.clone(), path)
     }
     /// Download unique resources and model dependencies with bounded workers.
     ///
@@ -507,39 +415,8 @@ impl FuelClient {
         ids: &[ResourceId],
         jobs: usize,
     ) -> Vec<Result<Downloaded, Error>> {
-        let v = crate::client::dispatch(
-            "client.batch",
-            &json!({"kind":kind.route(),"config":self.config,"ids":ids,"jobs":jobs}),
-        )
-        .unwrap();
-        let array = if kind == ResourceKind::World {
-            &v["results"]
-        } else {
-            &v
-        };
-        array
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|item| {
-                if item["result"] == 4 {
-                    decode_download(item)
-                } else {
-                    Err(Error("Fuel download failed".into()))
-                }
-            })
-            .collect()
+        crate::client::ClientCore::new(&self.config).download_many(kind, ids, jobs)
     }
-}
-fn decode_download(v: &Value) -> Result<Downloaded, Error> {
-    Ok(Downloaded {
-        id: serde_json::from_value(v["id"].clone()).map_err(|e| Error(e.to_string()))?,
-        path: v["path"].as_str().unwrap_or("").into(),
-        dependencies: serde_json::from_value(
-            v.get("dependencies").cloned().unwrap_or_else(|| json!([])),
-        )
-        .map_err(|e| Error(e.to_string()))?,
-    })
 }
 /// Lazy paginated listing. Transport, malformed response and repeated-page errors
 /// are yielded once; the iterator then remains exhausted.
@@ -550,13 +427,16 @@ fn decode_download(v: &Value) -> Result<Downloaded, Error> {
 /// produce an error rather than an apparently successful partial listing. Items
 /// already yielded remain available to the caller. This is a fused iterator.
 pub struct ResourceIter {
-    args: Value,
-    page: u32,
+    pager: crate::pagination::Pager,
     items: std::vec::IntoIter<ResourceId>,
-    previous: Value,
-    done: bool,
-    received: usize,
-    total: Option<usize>,
+}
+impl ResourceIter {
+    fn new(config: ClientConfig, kind: ResourceKind, server: ServerConfig, path: String) -> Self {
+        Self {
+            pager: crate::pagination::Pager::new(config, kind, server, path, vec![]),
+            items: vec![].into_iter(),
+        }
+    }
 }
 impl Iterator for ResourceIter {
     type Item = Result<ResourceId, Error>;
@@ -564,47 +444,14 @@ impl Iterator for ResourceIter {
         if let Some(id) = self.items.next() {
             return Some(Ok(id));
         }
-        if self.done {
-            return None;
-        }
-        let Some(next) = self.page.checked_add(1) else {
-            self.done = true;
-            return Some(Err(Error("Fuel listing page counter overflow".into())));
-        };
-        self.page = next;
-        self.args["page"] = json!(self.page);
-        let page = match crate::command::list_page_with_metadata(&self.args) {
-            Ok(page) => page,
-            Err(error) => {
-                self.done = true;
-                return Some(Err(Error(error)));
+        match self.pager.next_page() {
+            Ok(Some(items)) => {
+                self.items = items.into_iter();
+                self.items.next().map(Ok)
             }
-        };
-        self.received += page.items.as_array().map_or(0, Vec::len);
-        self.total = page.total.or(self.total);
-        match page.complete(self.received, self.total) {
-            Ok(done) => self.done = done,
-            Err(error) => {
-                self.done = true;
-                return Some(Err(Error(error)));
-            }
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
         }
-        if page.items.as_array().is_some_and(Vec::is_empty) {
-            return None;
-        }
-        if page.items == self.previous {
-            self.done = true;
-            return Some(Err(Error("Fuel server repeated a listing page".into())));
-        }
-        self.previous = page.items.clone();
-        match serde_json::from_value::<Vec<ResourceId>>(page.items) {
-            Ok(items) => self.items = items.into_iter(),
-            Err(error) => {
-                self.done = true;
-                return Some(Err(Error(format!("Invalid Fuel listing: {error}"))));
-            }
-        }
-        self.items.next().map(Ok)
     }
 }
 impl std::iter::FusedIterator for ResourceIter {}
@@ -612,6 +459,7 @@ impl std::iter::FusedIterator for ResourceIter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn listing_honors_advertised_boundaries_and_rejects_truncation() {
         use crate::client::tests::Server;
@@ -752,7 +600,7 @@ mod tests {
         };
         assert_eq!(
             escaped.url(ResourceKind::Model),
-            "http://example.com/prefix/Open%20Robotics/models/robot%20%252F%20mesh"
+            "http://example.com/prefix/open%20robotics/models/robot%20%252f%20mesh"
         );
         let invalid = ResourceId {
             server: ServerConfig {
@@ -788,7 +636,7 @@ mod tests {
         assert!(c.upload("/does-not-exist", &bad, &[], false, "").is_err());
         assert!(c.fetch("bad").is_err());
         assert!(c.cached(ResourceKind::Model, &bad).is_none());
-        assert!(c.dependencies(&bad, true).unwrap().is_empty());
+        assert!(c.dependencies(&bad, true).is_err());
         assert!(c.download_many(ResourceKind::Model, std::slice::from_ref(&bad), 0)[0].is_err());
         assert!(c.download_many(ResourceKind::World, &[bad], 2)[0].is_err());
         assert!(
@@ -806,6 +654,22 @@ mod tests {
         );
     }
     #[test]
+    fn nested_debug_output_redacts_credentials() {
+        let server = ServerConfig {
+            api_key: "secret-do-not-log".into(),
+            ..Default::default()
+        };
+        let client = FuelClient::new(ClientConfig {
+            servers: vec![server.clone()],
+            ..Default::default()
+        });
+        let id = ResourceId {
+            server,
+            ..Default::default()
+        };
+        assert!(!format!("{client:?} {id:?}").contains("secret-do-not-log"));
+    }
+    #[test]
     fn typed_configuration() {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("config.yaml");
@@ -820,12 +684,6 @@ mod tests {
         });
         assert!(client.update(ResourceKind::Model, &[]).is_ok());
         assert!(client.download_many(ResourceKind::World, &[], 1).is_empty());
-        let value = json!({"id":ResourceId::default(),"path":"/cache"});
-        assert_eq!(
-            decode_download(&value).unwrap().path,
-            PathBuf::from("/cache")
-        );
-        assert!(decode_download(&json!({})).is_err());
     }
 
     #[test]
@@ -983,8 +841,9 @@ mod tests {
         assert_eq!(iter.next().unwrap().unwrap().name, "box");
         assert!(iter.next().unwrap().is_err());
         assert!(iter.next().is_none());
-        let mut overflow = client.list(ResourceKind::Model, &srv, None);
-        overflow.page = u32::MAX;
+        let mut bounded = client.clone();
+        bounded.config.limits.max_pages = 0;
+        let mut overflow = bounded.list(ResourceKind::Model, &srv, None);
         assert!(overflow.next().unwrap().is_err());
         assert!(overflow.next().is_none());
     }

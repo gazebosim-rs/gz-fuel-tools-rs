@@ -12,6 +12,8 @@
 #include "gz/fuel_tools/WorldIdentifier.hh"
 namespace gz::fuel_tools::rs {
 Json::Value call(const std::string& op, const Json::Value& args = Json::Value(Json::objectValue));
+Json::Value call_binary(const std::string& op, const Json::Value& args, const std::string& body,
+                        std::string* outputBody = nullptr);
 Json::Value encode(const ServerConfig&);
 Json::Value encode(const ClientConfig&);
 Json::Value encode(const ModelIdentifier&);
@@ -22,17 +24,6 @@ void decode(const Json::Value&, ClientConfig&);
 void decode(const Json::Value&, ModelIdentifier&);
 void decode(const Json::Value&, WorldIdentifier&);
 void decode(const Json::Value&, CollectionIdentifier&);
-inline Json::Value bytes(const std::string& s) {
-  Json::Value v(Json::arrayValue);
-  for (unsigned char c : s) v.append(c);
-  return v;
-}
-inline std::string unbytes(const Json::Value& v) {
-  std::string s;
-  s.reserve(v.size());
-  for (const auto& c : v) s.push_back(static_cast<char>(c.asUInt()));
-  return s;
-}
 inline Json::Value strings(const std::vector<std::string>& s) {
   Json::Value v(Json::arrayValue);
   for (const auto& x : s) v.append(x);
