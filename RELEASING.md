@@ -48,6 +48,9 @@ for the checks below.
    integration and developer tooling. Build C++ from that archive with testing
    disabled, or supply the separately pinned upstream test checkout for parity
    testing. Neither distribution vendors third-party dependencies.
+   Keep include patterns anchored to the package root. The release script checks
+   both Cargo's list and the generated archive against the native distribution's
+   allowed paths, preventing files from ignored nested checkouts from entering it.
 6. Run `cargo publish --dry-run --locked` with registry access before requesting
    publication. The dry run uploads nothing, but Cargo may contact crates.io; an
    offline failure does not count as a successful dry run. Confirm that the crate

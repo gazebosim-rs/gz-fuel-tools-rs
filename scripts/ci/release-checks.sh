@@ -34,7 +34,10 @@ tar -xzf "$work/$name-source.tar.gz" -C "$work/source" --strip-components=1
 python3 "$work/source/scripts/check_versions.py"
 
 # Cargo verifies a freshly extracted crate and records the clean commit in its metadata.
+cargo package --list --locked > "$work/package-files.txt"
+python3 scripts/check_package.py --list "$work/package-files.txt"
 cargo package --locked --target-dir "$work/cargo"
+python3 scripts/check_package.py --crate "$work/cargo/package/$name.crate" --expected-list "$work/package-files.txt"
 cmake -S "$work/source" -B "$work/build" \
   -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$work/install" -DCMAKE_INSTALL_LIBDIR="$libdir"

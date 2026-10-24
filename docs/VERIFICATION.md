@@ -15,7 +15,7 @@ active compiler. No original Fuel implementation is compiled or linked.
 | Complete CTest run | 21/21 suites pass, zero failures |
 | Rust unit tests | 55 pass, zero failures or ignored tests |
 | Standalone Rust CLI integration tests | 2 pass |
-| Coverage/version Python regression tests | 4 pass, including deliberate version-drift cases |
+| Coverage/version/package Python regression tests | 8 pass, including deliberate version drift and nested-checkout contamination |
 | Rust formatting | Pass |
 | Clippy, all targets, warnings denied | Pass |
 

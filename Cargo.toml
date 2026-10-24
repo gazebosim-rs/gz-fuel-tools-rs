@@ -10,7 +10,7 @@ documentation = "https://docs.rs/gz-fuel-tools"
 readme = "README.md"
 keywords = ["gazebo", "fuel", "robotics", "simulation"]
 categories = ["command-line-utilities", "web-programming::http-client"]
-include = ["Cargo.lock", "LICENSE", "README.md", "CHANGELOG.md", "RELEASING.md", "CONTRIBUTING.md", "SECURITY.md", "docs/**", "src/**", "tests/cli.rs"]
+include = ["/Cargo.lock", "/LICENSE", "/README.md", "/CHANGELOG.md", "/RELEASING.md", "/CONTRIBUTING.md", "/SECURITY.md", "/docs/**", "/src/**", "/tests/cli.rs"]
 
 [lib]
 name = "gz_fuel_tools"

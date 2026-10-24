@@ -6,7 +6,7 @@ never built into or linked by this library. Public C++ declarations are retained
 from upstream commit `6ac62b01d7d8af3ab23fd2239728a791704a3f09` under Apache-2.0.
 
 Final validation: all 21 C++ suites (including upstream-disabled service tests),
-55 Rust unit tests, two CLI integration tests and four validation-script tests pass.
+55 Rust unit tests, two CLI integration tests and eight validation-script tests pass.
 Production line coverage is **97.19% Rust** and **97.06% C++**. See the
 [verification report](docs/VERIFICATION.md) for evidence and scope.
 

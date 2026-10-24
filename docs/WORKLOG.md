@@ -140,3 +140,13 @@
   all 21 C++ suites pass. Rust coverage 2736/2815 = 97.1936%, C++ coverage
   1319/1359 = 97.0567%. Formatting, Clippy and documentation checks pass.
   Hosted CI independently repeats the gates on the protected pull request.
+- Hosted PR validation passed Rust, dependency/workflow policy and original C++
+  parity, then rejected packaging: unanchored Cargo filename globs matched README
+  and license files in the ignored nested upstream checkout. The required gate
+  failed and blocked merging. Anchoring distribution paths and checking both the
+  package file list and produced archive prevents this contamination without
+  allowing dirty packaging or weakening the clean-checkout rule.
+- The packaging regression now reproduces an ignored nested Git checkout using
+  real Cargo. All eight Python validation tests pass; a clean snapshot containing
+  the real upstream checkout produces and verifies exactly 26 native crate files,
+  with list/archive agreement and no upstream paths. No --allow-dirty is used.
