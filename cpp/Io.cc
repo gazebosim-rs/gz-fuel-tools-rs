@@ -31,21 +31,18 @@ RestResponse Rest::Request(HttpMethod method, const std::string& url, const std:
   a["user_agent"] = userAgent;
   a["query"] = Json::Value(Json::arrayValue);
   a["headers"] = Json::Value(Json::arrayValue);
-  a["data"] = Json::Value(Json::arrayValue);
   a["form"] = Json::Value(Json::arrayValue);
   for (const auto& v : query) a["query"].append(v);
   for (const auto& v : headers) a["headers"].append(v);
-  for (unsigned char v : data) a["data"].append(static_cast<unsigned>(v));
   for (const auto& [key, value] : form) {
     Json::Value pair(Json::arrayValue);
     pair.append(key);
     pair.append(value);
     a["form"].append(pair);
   }
-  const auto output = rs::call("io.request", a);
   RestResponse response;
+  const auto output = rs::call_binary("io.request", a, data, &response.data);
   response.statusCode = output["status"].asInt();
-  for (const auto& v : output["data"]) response.data.push_back(static_cast<char>(v.asUInt()));
   for (const auto& key : output["headers"].getMemberNames())
     response.headers[key] = output["headers"][key].asString();
   return response;

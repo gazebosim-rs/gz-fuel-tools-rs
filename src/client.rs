@@ -1,688 +1,263 @@
 // Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
-//! Shared model/world client operations. All storage and HTTP use the same IO layer.
+//! Legacy JSON compatibility adaptation around the typed resource domain.
+pub(crate) use crate::client_native::ClientCore;
+use crate::{ClientConfig, Downloaded, Error, ResourceId, ResourceKind, identity};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
-    fs,
-    path::{Component, Path},
-};
-
-fn s<'a>(v: &'a Value, k: &str) -> &'a str {
-    v[k].as_str().unwrap_or("")
+#[cfg(test)]
+use std::{fs, path::Path};
+fn s<'a>(value: &'a Value, key: &str) -> &'a str {
+    value[key].as_str().unwrap_or("")
 }
-fn core(op: &str, a: Value) -> Value {
-    crate::core::dispatch(op, &a).unwrap_or(Value::Null)
+#[cfg(test)]
+fn io(op: &str, args: Value) -> Value {
+    crate::io::dispatch(op, &args).unwrap_or(Value::Null)
 }
-fn io(op: &str, a: Value) -> Value {
-    crate::io::dispatch(op, &a).unwrap_or(Value::Null)
+fn kind(value: &str) -> Option<ResourceKind> {
+    match value {
+        "models" => Some(ResourceKind::Model),
+        "worlds" => Some(ResourceKind::World),
+        "collections" => Some(ResourceKind::Collection),
+        _ => None,
+    }
 }
-fn result(code: i32) -> Value {
-    json!({"result":code})
+fn config(value: &Value) -> Result<ClientConfig, Error> {
+    crate::core::typed_config(value)
 }
-fn resource_key(id: &Value) -> (String, String, String, u64) {
-    (
-        s(&id["server"], "url").trim_end_matches('/').to_owned(),
-        s(id, "owner").to_owned(),
-        s(id, "name").to_owned(),
-        id["version"].as_u64().unwrap_or(0),
-    )
-}
-fn valid_component(value: &str) -> bool {
-    !value.is_empty() && value != "." && value != ".." && !value.contains(['/', '\\', '\0'])
-}
-
+#[cfg(test)]
 fn api_version(value: &str) -> bool {
-    value.split_once('.').is_some_and(|(x, y)| {
-        !x.is_empty() && !y.is_empty() && x.bytes().chain(y.bytes()).all(|b| b.is_ascii_digit())
+    value.split_once('.').is_some_and(|(a, b)| {
+        !a.is_empty() && !b.is_empty() && a.bytes().chain(b.bytes()).all(|n| n.is_ascii_digit())
     })
 }
-
-/// Parse a Fuel URL while retaining the resource's spaces and existing escapes.
-/// Configured server versions and credentials take precedence, as in the C++ API.
-pub fn parse_url(url: &str, config: &Value, kind: &str, file: bool) -> Option<Value> {
-    let (scheme, tail) = url.split_once("://")?;
-    if scheme.is_empty()
-        || !scheme
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
-    {
-        return None;
-    }
-    let (authority, path) = tail.split_once('/')?;
-    if authority.is_empty()
-        || authority.chars().any(char::is_whitespace)
-        || url.contains(['?', '#', '\0', '\\'])
-    {
-        return None;
-    }
-    let mut parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    let api = if parts.first().is_some_and(|x| api_version(x)) {
-        parts.remove(0)
-    } else {
-        ""
-    };
-    if parts.len() < 3 || parts[1] != kind {
-        return None;
-    }
-    let owner = percent_encoding::percent_decode_str(parts[0])
-        .decode_utf8()
-        .ok()?;
-    let name = percent_encoding::percent_decode_str(parts[2])
-        .decode_utf8()
-        .ok()?;
-    if !valid_component(&owner) || !valid_component(&name) {
-        return None;
-    }
-    let mut id = core("id_default", json!({"kind":kind}));
-    id["owner"] = json!(if kind == "collections" {
-        owner.into_owned()
-    } else {
-        owner.to_ascii_lowercase()
-    });
-    id["name"] = json!(if kind == "collections" {
-        name.into_owned()
-    } else {
-        name.to_ascii_lowercase()
-    });
-    let mut server = json!({"url":format!("{scheme}://{authority}"),"version":api,"api_key":"","has_authority":true});
-    if let Some(servers) = config["servers"].as_array() {
-        for srv in servers {
-            if s(srv, "url").trim_end_matches('/') == s(&server, "url") {
-                server = srv.clone();
-                break;
-            }
-        }
-    }
-    id["server"] = server;
-    if kind == "collections" {
-        return (parts.len() == 3 && !file).then(|| json!({"id":id,"file":""}));
-    }
-    let ver = parts.get(3).copied().unwrap_or("");
-    let version = if ver.is_empty() || ver == "tip" {
-        0
-    } else {
-        ver.parse::<u32>().ok()?
-    };
-    id["version"] = json!(version);
-    let file_path = if file {
-        if parts.len() < 6 || parts[4] != "files" {
-            return None;
-        }
-        let path = parts[5..].join("/");
-        // Reject both literal and escaped parent components before joining a cache path.
-        let decoded = percent_encoding::percent_decode_str(&path)
-            .decode_utf8()
-            .ok()?;
-        if decoded.split(['/', '\\']).any(|c| c == ".." || c == ".") {
-            return None;
-        }
-        path
-    } else {
-        if parts.len() > 4 {
-            return None;
-        }
-        String::new()
-    };
-    Some(json!({"id":id,"file":file_path}))
+pub(crate) fn parse_url(url: &str, settings: &Value, route: &str, file: bool) -> Option<Value> {
+    let parsed = identity::parse(url, &config(settings).ok()?, kind(route)?, file).ok()?;
+    Some(json!({"id":parsed.id,"file":parsed.file.unwrap_or_default()}))
 }
-fn headers(a: &Value, id: &Value) -> Value {
-    let mut out =
-        if a["header_origin"].is_null() || a["header_origin"] == origin(s(&id["server"], "url")) {
-            a["headers"].as_array().cloned().unwrap_or_default()
-        } else {
-            vec![]
-        };
-    if !out.iter().any(|h| {
-        h.as_str()
-            .and_then(|x| x.split_once(':'))
-            .is_some_and(|(k, _)| k.eq_ignore_ascii_case("private-token"))
+fn origin(value: &str) -> Value {
+    url::Url::parse(value)
+        .map(|url| json!([url.scheme(), url.host_str(), url.port_or_known_default()]))
+        .unwrap_or_else(|_| json!(value))
+}
+fn headers(args: &Value, id: &Value) -> Value {
+    let mut headers = if args["header_origin"].is_null()
+        || args["header_origin"] == origin(s(&id["server"], "url"))
+    {
+        args["headers"].as_array().cloned().unwrap_or_default()
+    } else {
+        vec![]
+    };
+    if !headers.iter().any(|line| {
+        line.as_str()
+            .and_then(|line| line.split_once(':'))
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("private-token"))
     }) && !s(&id["server"], "api_key").is_empty()
     {
-        out.push(json!(format!(
+        headers.push(json!(format!(
             "Private-token: {}",
             s(&id["server"], "api_key")
         )));
     }
-    json!(out)
+    json!(headers)
 }
-fn origin(value: &str) -> Value {
-    url::Url::parse(value)
-        .ok()
-        .map(|url| json!([url.scheme(), url.host_str(), url.port_or_known_default()]))
-        .unwrap_or_else(|| json!(value))
-}
-fn request(
-    a: &Value,
-    id: &Value,
-    method: i32,
-    path: &str,
-    query: Value,
-    form: Value,
-) -> crate::io::Response {
-    const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
-        .remove(b'-')
-        .remove(b'_')
-        .remove(b'.')
-        .remove(b'~');
-    let encoded_path = path
-        .split('/')
-        .map(|part| percent_encoding::utf8_percent_encode(part, SEGMENT).to_string())
-        .collect::<Vec<_>>()
-        .join("/");
-    crate::io::transport(
-        &json!({"method":method,"url":id["server"]["url"],"version":id["server"]["version"],"path":encoded_path,"path_encoded":true,"query":query,"headers":headers(a,id),"data":[],"form":form,"user_agent":a["config"]["user_agent"]}),
-    )
-}
-fn body(resp: &crate::io::Response) -> String {
-    String::from_utf8(resp.data.clone()).unwrap_or_default()
-}
-fn header<'a>(resp: &'a crate::io::Response, key: &str) -> Option<&'a str> {
-    resp.headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v.as_str())
-}
-fn version(id: &Value) -> String {
-    match id["version"].as_u64().unwrap_or(0) {
-        0 => "tip".into(),
-        n => n.to_string(),
-    }
-}
-fn route(id: &Value, kind: &str) -> String {
-    format!("{}/{}/{}", s(id, "owner"), kind, s(id, "name"))
-}
-fn configured(id: &Value) -> bool {
-    valid_component(s(id, "name"))
-        && valid_component(s(id, "owner"))
-        && !s(&id["server"], "url").is_empty()
-        && !s(&id["server"], "version").is_empty()
-}
-fn cached(a: &Value, id: &Value, kind: &str) -> Option<Value> {
-    io(
-        "io.cache_list",
-        json!({"config":a["config"],"kind":kind,"id":id,"exact":true}),
-    )
-    .as_array()?
-    .first()
-    .cloned()
-}
-fn details(a: &Value) -> Value {
-    let id = &a["id"];
-    let kind = s(a, "kind");
-    if !configured(id) {
-        return result(7);
-    }
-    let resp = request(a, id, 0, &route(id, kind), json!([]), json!([]));
-    if resp.status != 200 {
-        return result(7);
-    }
-    let value = core(
-        "json_parse",
-        json!({"text":body(&resp),"kind":kind,"server":id["server"],"many":false}),
-    );
-    if s(&value, "name").is_empty() {
-        return result(7);
-    }
-    json!({"result":4,"id":value})
-}
-fn zip_bytes(a: &Value, mut resp: crate::io::Response) -> Option<Vec<u8>> {
-    let mut seen = HashSet::new();
-    for _ in 0..8 {
-        if resp.status != 200 {
-            return None;
+fn downloaded(value: Result<Downloaded, Error>) -> Value {
+    match value {
+        Ok(value) => {
+            json!({"result":4,"id":value.id,"path":value.path,"dependencies":value.dependencies})
         }
-        match header(&resp, "content-type")
-            .unwrap_or("")
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-        {
-            "text/plain" => {
-                let url = body(&resp).trim().to_owned();
-                if !url.starts_with("http://") && !url.starts_with("https://")
-                    || !seen.insert(url.clone())
-                {
-                    return None;
-                }
-                resp = crate::io::transport(
-                    &json!({"method":0,"url":url,"version":"","path":"","query":[],"headers":[],"data":[],"form":[],"user_agent":a["config"]["user_agent"]}),
-                );
-            }
-            "" | "application/zip" | "binary/octet-stream" | "application/octet-stream" => {
-                return Some(resp.data);
-            }
-            _ => return None,
-        }
+        Err(error) => json!({"result":7,"error":error.to_string()}),
     }
-    None
 }
-fn download_one(a: &Value) -> Value {
-    let id = &a["id"];
-    let kind = s(a, "kind");
-    if !configured(id) {
-        return result(7);
+fn result(value: Result<(), Error>, success: u8, failure: u8) -> Value {
+    match value {
+        Ok(()) => json!({"result":success}),
+        Err(error) => json!({"result":failure,"error":error.to_string()}),
     }
-    let path = format!("{}/{}/{}.zip", route(id, kind), version(id), s(id, "name"));
-    let resp = request(a, id, 0, &path, json!(["link=true"]), json!([]));
-    if resp.status != 200 {
-        return result(7);
+}
+fn cached_file(args: &Value, config: &ClientConfig, kind: ResourceKind) -> Value {
+    let found = (|| {
+        let parsed = identity::parse(s(args, "url"), config, kind, true)?;
+        let entry = crate::io::lookup_resource(config, kind, &parsed.id)?
+            .ok_or_else(|| Error::from("Fuel resource is not cached"))?;
+        let path = entry.path.join(parsed.file.unwrap());
+        let root = entry.path.canonicalize()?;
+        let real = path.canonicalize()?;
+        if !real.starts_with(root) || !real.is_file() {
+            return Err(Error::from("Invalid cached Fuel file"));
+        }
+        Ok::<_, Error>(path)
+    })();
+    match found {
+        Ok(path) => json!({"result":5,"path":path}),
+        Err(error) => json!({"result":7,"error":error.to_string()}),
     }
-    let v = header(&resp, "X-Ign-Resource-Version")
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or_else(|| id["version"].as_u64().filter(|n| *n > 0).unwrap_or(1) as u32);
-    let Some(bytes) = zip_bytes(a, resp) else {
-        return result(7);
+}
+pub(crate) fn dispatch(op: &str, args: &Value) -> Option<Value> {
+    if !op.starts_with("client.") {
+        return None;
+    }
+    if op == "client.headers" {
+        return Some(headers(args, &args["id"]));
+    }
+    if op == "client.parse" {
+        return Some(
+            parse_url(
+                s(args, "url"),
+                &args["config"],
+                s(args, "kind"),
+                args["file"].as_bool().unwrap_or(false),
+            )
+            .unwrap_or(Value::Null),
+        );
+    }
+    let settings = match config(&args["config"]) {
+        Ok(config) => config,
+        Err(error) => return Some(json!({"result":7,"error":error.to_string()})),
     };
-    let mut new_id = id.clone();
-    new_id["version"] = json!(v);
-    let saved = crate::io::cache_save_bytes(
-        &json!({"config":a["config"],"kind":kind,"id":new_id,"overwrite":true}),
-        &bytes,
-    );
-    if saved["ok"] != true {
-        return result(7);
-    }
-    json!({"result":4,"id":saved["id"],"path":saved["path"]})
-}
-fn metadata(path: &Path) -> Option<Value> {
-    let pb = path.join("metadata.pbtxt");
-    if pb.is_file() {
-        crate::command::parse_pbtxt(&fs::read_to_string(pb).ok()?).ok()
-    } else {
-        crate::command::parse_config(&fs::read_to_string(path.join("model.config")).ok()?).ok()
-    }
-}
-fn dependencies(a: &Value, id: &Value) -> Option<Vec<Value>> {
-    let Some(entry) = cached(a, id, "models") else {
-        return Some(vec![]);
-    };
-    let path = Path::new(s(&entry, "path"));
-    if !path.join("metadata.pbtxt").exists() && !path.join("model.config").exists() {
-        return Some(vec![]);
-    }
-    let meta = metadata(path)?;
-    let mut deps = vec![];
-    if let Some(items) = meta["dependencies"].as_array() {
-        for item in items {
-            let url = item.as_str().unwrap_or_else(|| s(item, "uri"));
-            if let Some(parsed) = parse_url(url, &a["config"], "models", false) {
-                deps.push(parsed["id"].clone());
-            }
-        }
-    }
-    Some(deps)
-}
-fn dep_closure(a: &Value, ids: Vec<Value>, recursive: bool) -> Value {
-    let mut queue: VecDeque<Value> = ids.into();
-    let mut seen = HashSet::new();
-    let mut out = vec![];
-    while let Some(id) = queue.pop_front() {
-        if !seen.insert(resource_key(&id)) {
-            continue;
-        }
-        let Some(deps) = dependencies(a, &id) else {
-            return result(7);
-        };
-        for dep in deps {
-            if !out.contains(&dep) {
-                out.push(dep.clone());
-                if recursive {
-                    queue.push_back(dep);
-                }
-            }
-        }
-    }
-    json!({"result":4,"dependencies":out})
-}
-fn download(a: &Value) -> Value {
-    let mut scoped = a.clone();
-    if scoped["header_origin"].is_null() {
-        scoped["header_origin"] = origin(s(&a["id"]["server"], "url"));
-    }
-    let a = &scoped;
-    let output = download_one(a);
-    if output["result"] != 4 || s(a, "kind") != "models" {
-        return output;
-    }
-    let Some(deps) = dependencies(a, &output["id"]) else {
-        return result(7);
-    };
-    let mut output = output;
-    output["dependencies"] = json!(deps);
-    if a["recursive"].as_bool().unwrap_or(true) {
-        let mut queue: VecDeque<Value> = deps.into();
-        let mut seen = HashSet::from([resource_key(&a["id"]), resource_key(&output["id"])]);
-        while let Some(id) = queue.pop_front() {
-            if !seen.insert(resource_key(&id)) {
-                continue;
-            }
-            if let Some(entry) = cached(a, &id, "models") {
-                let Some(next) = dependencies(a, &entry["id"]) else {
-                    return result(7);
-                };
-                queue.extend(next);
-                continue;
-            }
-            let mut sub = a.clone();
-            sub["id"] = id;
-            let res = download_one(&sub);
-            if res["result"] != 4 {
-                return res;
-            }
-            let Some(next) = dependencies(&sub, &res["id"]) else {
-                return result(7);
-            };
-            queue.extend(next);
-        }
-    }
-    output
-}
-fn upload(a: &Value, patch: bool) -> Value {
-    let id = &a["id"];
-    let path = Path::new(s(a, "path"));
-    let mut form = vec![];
-    if !patch || !s(a, "path").is_empty() {
-        let Some(meta) = metadata(path) else {
-            return result(10);
-        };
-        form.push(json!(["name", meta["name"].as_str().unwrap_or("")]));
-        form.push(json!([
-            "description",
-            meta["description"].as_str().unwrap_or("")
-        ]));
-        if !s(a, "owner").is_empty() {
-            form.push(json!(["owner", s(a, "owner")]));
-        }
-        let license = s(&meta, "license");
-        let license_id = if license.is_empty() {
-            1
-        } else {
-            let resp = request(a, id, 0, "licenses", json!([]), json!([]));
-            if resp.status != 200 {
-                return result(10);
-            }
-            let licenses = core("json_licenses", json!({"text":body(&resp)}));
-            let Some(n) = licenses["licenses"][license].as_u64() else {
-                return result(10);
-            };
-            n
-        };
-        form.push(json!(["license", license_id.to_string()]));
-        for field in ["tags", "categories"] {
-            let values = meta[field]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(",")
-                })
-                .unwrap_or_default();
-            if !values.is_empty() {
-                form.push(json!([field, values]));
-            }
-        }
-        if let Some(annotations) = meta["annotations"].as_object() {
-            for (k, v) in annotations {
-                form.push(json!(["metadata", json!({"key":k,"value":v}).to_string()]));
-            }
-        }
-        fn files(dir: &Path, root: &Path, out: &mut Vec<Value>) -> std::io::Result<()> {
-            for entry in fs::read_dir(dir)? {
-                let e = entry?;
-                let ty = e.file_type()?;
-                if ty.is_symlink() {
-                    return Err(std::io::Error::other("Symlink in model upload"));
-                }
-                if ty.is_dir() {
-                    files(&e.path(), root, out)?;
-                } else if ty.is_file() {
-                    out.push(json!(["file", {"file":e.path(),"filename":e.path().strip_prefix(root).unwrap()}]));
-                }
-            }
-            Ok(())
-        }
-        if files(path, path, &mut form).is_err() {
-            return result(10);
-        }
-    }
-    form.push(json!([
-        "private",
-        if a["private"].as_bool().unwrap_or(false) {
-            "1"
-        } else {
-            "0"
-        }
-    ]));
-    if !configured(id) && patch {
-        return result(11);
-    }
-    let response = request(
-        a,
-        id,
-        if patch { 6 } else { 5 },
-        &if patch {
-            route(id, "models")
-        } else {
-            "models".into()
-        },
-        json!([]),
-        json!(form),
-    );
-    result(if response.status == 200 {
-        if patch { 12 } else { 8 }
-    } else if patch {
-        11
-    } else {
-        10
-    })
-}
-fn cached_file(a: &Value) -> Value {
-    let Some(parsed) = parse_url(s(a, "url"), &a["config"], s(a, "kind"), true) else {
-        return result(7);
-    };
-    let Some(entry) = cached(a, &parsed["id"], s(a, "kind")) else {
-        return result(7);
-    };
-    let base = Path::new(s(&entry, "path"));
-    let Ok(file) = percent_encoding::percent_decode_str(s(&parsed, "file")).decode_utf8() else {
-        return result(7);
-    };
-    if file.contains(['\\', '\0'])
-        || Path::new(file.as_ref())
-            .components()
-            .any(|c| !matches!(c, Component::Normal(_)))
-    {
-        return result(7);
-    }
-    let path = base.join(file.as_ref());
-    let (Ok(root), Ok(real)) = (base.canonicalize(), path.canonicalize()) else {
-        return result(7);
-    };
-    if !real.starts_with(root) {
-        return result(7);
-    }
-    json!({"result":5,"path":path.to_string_lossy()})
-}
-fn update(a: &Value) -> Value {
-    let kind = s(a, "kind");
-    let entries = io("io.cache_list", json!({"config":a["config"],"kind":kind}));
-    let mut latest: BTreeMap<String, Value> = BTreeMap::new();
-    for entry in entries.as_array().unwrap_or(&vec![]) {
-        let id = &entry["id"];
-        let key = route(id, kind) + s(&id["server"], "url");
-        if latest
-            .get(&key)
-            .is_none_or(|old| old["version"].as_u64() < id["version"].as_u64())
-        {
-            latest.insert(key, id.clone());
-        }
-    }
-    let mut ok = true;
-    for id in latest.into_values() {
-        let mut args = a.clone();
-        args["id"] = id.clone();
-        let cloud = details(&args);
-        if cloud["result"] != 4 {
-            ok = false;
-        } else if cloud["id"]["version"].as_u64() > id["version"].as_u64() {
-            args["id"] = cloud["id"].clone();
-            ok &= download(&args)["result"] == 4;
-        }
-    }
-    json!(ok)
-}
-fn batch(a: &Value) -> Value {
-    let jobs = a["jobs"].as_u64().unwrap_or(2).clamp(1, 64) as usize;
-    let mut pending = a["ids"]
+    let core = ClientCore::new(&settings);
+    let id = serde_json::from_value::<ResourceId>(args["id"].clone()).unwrap_or_default();
+    let resource_kind = kind(s(args, "kind")).unwrap_or(ResourceKind::Model);
+    let request_headers = args["headers"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|id| (id.clone(), origin(s(&id["server"], "url"))))
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
-    let mut seen = HashSet::new();
-    let mut results = vec![];
-    while !pending.is_empty() {
-        pending.retain(|(id, _)| seen.insert(resource_key(id)));
-        let mut next = vec![];
-        for chunk in pending.chunks(jobs) {
-            let wave = std::thread::scope(|scope| {
-                let handles = chunk
-                    .iter()
-                    .map(|(id, header_origin)| {
-                        scope.spawn(move || {
-                            let mut args = a.clone();
-                            args["id"] = id.clone();
-                            args["header_origin"] = header_origin.clone();
-                            args["recursive"] = json!(false);
-                            let mut out = download(&args);
-                            out["requested_id"] = id.clone();
-                            if out.get("id").is_none() {
-                                out["id"] = id.clone();
-                            }
-                            out
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|_| result(7)))
-                    .collect::<Vec<_>>()
-            });
-            for (out, (_, header_origin)) in wave.into_iter().zip(chunk) {
-                if s(a, "kind") == "models"
-                    && let Some(deps) = out["dependencies"].as_array()
-                {
-                    next.extend(deps.iter().cloned().map(|id| (id, header_origin.clone())));
-                }
-                results.push(out);
-            }
-        }
-        pending = next;
-    }
-    if s(a, "kind") == "worlds" {
-        json!({"ok":results.iter().all(|r|r["result"]==4),"results":results})
-    } else {
-        json!(results)
-    }
-}
-/// Internal compatibility dispatch. Native Rust callers may use `FuelClient`.
-pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
     Some(match op {
-        "client.batch" => batch(a),
-        "client.headers" => headers(a, &a["id"]),
-        "client.licenses" => {
-            let resp = request(a, &a["id"], 0, "licenses", json!([]), json!([]));
-            core("json_licenses", json!({"text":body(&resp)}))
-        }
-        "client.list_path" => {
-            let id = &a["id"];
-            let kind = s(a, "kind");
-            json!(if a["collection"] == true {
-                format!("{}/collections/{}/{}", s(id, "owner"), s(id, "name"), kind)
-            } else if !s(id, "owner").is_empty() {
-                if !s(id, "name").is_empty() {
-                    route(id, kind)
-                } else {
-                    format!("{}/{}", s(id, "owner"), kind)
-                }
-            } else if kind == "worlds" {
-                kind.to_owned()
-            } else {
-                String::new()
-            })
-        }
         "client.parse" => parse_url(
-            s(a, "url"),
-            &a["config"],
-            s(a, "kind"),
-            a["file"].as_bool().unwrap_or(false),
+            s(args, "url"),
+            &args["config"],
+            s(args, "kind"),
+            args["file"].as_bool().unwrap_or(false),
         )
         .unwrap_or(Value::Null),
-        "client.details" => details(a),
-        "client.download" => download(a),
-        "client.dependencies" => dep_closure(
-            a,
-            a["ids"]
-                .as_array()
-                .cloned()
-                .unwrap_or_else(|| vec![a["id"].clone()]),
-            a["recursive"].as_bool().unwrap_or(false),
-        ),
-        "client.cached_file" => cached_file(a),
-        "client.upload" => upload(a, false),
-        "client.patch" => upload(a, true),
-        "client.delete" => {
-            let id = &a["id"];
-            if !configured(id) {
-                result(3)
+        "client.headers" => headers(args, &args["id"]),
+        "client.list_path" => json!(if args["collection"] == true {
+            format!(
+                "{}/collections/{}/{}",
+                id.owner,
+                id.name,
+                resource_kind.route()
+            )
+        } else if !id.owner.is_empty() {
+            if !id.name.is_empty() {
+                format!("{}/{}/{}", id.owner, resource_kind.route(), id.name)
             } else {
-                let resp = request(a, id, 2, &route(id, s(a, "kind")), json!([]), json!([]));
-                result(match resp.status {
-                    200 | 204 => 1,
-                    404 => 2,
-                    _ => 3,
-                })
+                format!("{}/{}", id.owner, resource_kind.route())
+            }
+        } else if resource_kind == ResourceKind::World {
+            "worlds".into()
+        } else {
+            String::new()
+        }),
+        "client.details" => match core.details(resource_kind, &id, &request_headers) {
+            Ok(id) => json!({"result":4,"id":id}),
+            Err(error) => json!({"result":7,"error":error.to_string()}),
+        },
+        "client.download" => downloaded(if args["recursive"] == false {
+            core.download_shallow(resource_kind, &id, &request_headers)
+        } else {
+            core.download(resource_kind, &id, &request_headers)
+        }),
+        "client.dependencies" => {
+            let ids = if let Some(ids) = args["ids"].as_array() {
+                ids.iter()
+                    .filter_map(|value| serde_json::from_value(value.clone()).ok())
+                    .collect()
+            } else {
+                vec![id.clone()]
+            };
+            let mut dependencies = vec![];
+            let mut failure = None;
+            for id in ids {
+                match core.dependencies(&id, args["recursive"].as_bool().unwrap_or(false)) {
+                    Ok(items) => {
+                        for item in items {
+                            if !dependencies.contains(&item) {
+                                dependencies.push(item);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                json!({"result":7,"error":error.to_string()})
+            } else {
+                json!({"result":4,"dependencies":dependencies})
             }
         }
-        "client.update" => update(a),
-        "client.fetch" => fetch(a),
+        "client.batch" => {
+            let ids =
+                serde_json::from_value::<Vec<ResourceId>>(args["ids"].clone()).unwrap_or_default();
+            let jobs = args["jobs"].as_u64().unwrap_or(2).clamp(1, 64) as usize;
+            let results = core
+                .download_many_with_headers(resource_kind, &ids, jobs, &request_headers)
+                .into_iter()
+                .map(downloaded)
+                .collect::<Vec<_>>();
+            if resource_kind == ResourceKind::World {
+                json!({"ok":results.iter().all(|item|item["result"]==4),"results":results})
+            } else {
+                json!(results)
+            }
+        }
+        "client.cached_file" => cached_file(args, &settings, resource_kind),
+        "client.fetch" => json!(core.fetch(s(args, "url")).ok().unwrap_or_default()),
+        "client.upload" => result(
+            core.upload(
+                std::path::Path::new(s(args, "path")),
+                &id,
+                &request_headers,
+                args["private"].as_bool().unwrap_or(false),
+                s(args, "owner"),
+            ),
+            8,
+            10,
+        ),
+        "client.patch" => {
+            let mut id = id;
+            id.private = args["private"].as_bool().unwrap_or(id.private);
+            let path = (!s(args, "path").is_empty()).then(|| std::path::Path::new(s(args, "path")));
+            match core.patch(&id, &request_headers, path) {
+                Ok(()) => json!({"result":12}),
+                Err(error) => {
+                    let upload_error = path.is_some()
+                        && (matches!(
+                            error.kind,
+                            crate::ErrorKind::Io
+                                | crate::ErrorKind::Metadata
+                                | crate::ErrorKind::Limit
+                        ) || (error.kind == crate::ErrorKind::InvalidInput
+                            && identity::canonicalize(&id, ResourceKind::Model).is_ok()));
+                    json!({"result":if upload_error{10}else{11},"error":error.to_string()})
+                }
+            }
+        }
+        "client.delete" => match core.delete(resource_kind, &id, &request_headers) {
+            Ok(()) => json!({"result":1}),
+            Err(error) => {
+                json!({"result":if error.status==Some(404){2}else{3},"error":error.to_string()})
+            }
+        },
+        "client.update" => json!(core.update(resource_kind, &request_headers).is_ok()),
+        "client.licenses" => {
+            let response = crate::transport::transport(
+                &json!({"method":0,"url":id.server.url,"version":id.server.version,"path":"licenses","headers":headers(args,&args["id"]),"user_agent":settings.user_agent}),
+            );
+            crate::core::dispatch(
+                "json_licenses",
+                &json!({"text":String::from_utf8_lossy(&response.data)}),
+            )
+            .unwrap_or(Value::Null)
+        }
         _ => return None,
     })
 }
-fn fetch(a: &Value) -> Value {
-    for kind in ["models", "worlds"] {
-        for file in [false, true] {
-            if let Some(parsed) = parse_url(s(a, "url"), &a["config"], kind, file) {
-                let mut args = a.clone();
-                args["kind"] = json!(kind);
-                args["id"] = parsed["id"].clone();
-                if file {
-                    let found = cached_file(&args);
-                    if found["result"] == 5 {
-                        return found["path"].clone();
-                    }
-                } else if let Some(entry) = cached(&args, &args["id"], kind) {
-                    return entry["path"].clone();
-                }
-                let res = download(&args);
-                if res["result"] != 4 {
-                    return json!("");
-                }
-                if file {
-                    let found = cached_file(&args);
-                    return found["path"].as_str().map_or(json!(""), |p| json!(p));
-                }
-                return res["path"].clone();
-            }
-        }
-    }
-    json!("")
-}
-
 #[cfg(test)]
 #[path = "client_tests.rs"]
 pub(crate) mod tests;

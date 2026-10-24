@@ -110,6 +110,13 @@ fn archive(entries: &[(&str, &str)]) -> Vec<u8> {
     zip.finish().unwrap().into_inner()
 }
 pub(crate) fn model_zip(meta: Option<&str>) -> Vec<u8> {
+    let complete = meta.map(|text| {
+        if text.trim_start().starts_with("name:") {
+            text.to_owned()
+        } else {
+            format!("name: \"box\" {text}")
+        }
+    });
     let mut entries = vec![
         (
             "model.config",
@@ -117,8 +124,8 @@ pub(crate) fn model_zip(meta: Option<&str>) -> Vec<u8> {
         ),
         ("model.sdf", "<sdf version='1.10'><model name='box'/></sdf>"),
     ];
-    if let Some(meta) = meta {
-        entries.push(("metadata.pbtxt", meta));
+    if let Some(meta) = &complete {
+        entries.push(("metadata.pbtxt", meta.as_str()));
     }
     archive(&entries)
 }
@@ -135,7 +142,11 @@ fn upload_metadata_is_literal_and_filenames_do_not_use_delimiters() {
     fs::write(model.path().join("model.config"), format!(
         "<model><name>@someone</name><description>@{}</description><sdf version='1.9'>model.sdf</sdf></model>", secret.display()
     )).unwrap();
-    fs::write(model.path().join("model.sdf"), "<sdf/>").unwrap();
+    fs::write(
+        model.path().join("model.sdf"),
+        "<sdf version='1.9'><model name='test'/></sdf>",
+    )
+    .unwrap();
     fs::write(model.path().join("asset;literal.txt"), "asset payload").unwrap();
     let server = Server::new(|_| reply(200, "ok"));
     let mut args = server.args(cache.path(), "models");
@@ -395,7 +406,7 @@ fn details_delete_and_error_responses() {
 #[test]
 fn world_download_cache_files_fetch_and_explicit_version_fallback() {
     let temp = tempfile::tempdir().unwrap();
-    let data = archive(&[("world.sdf", "<sdf/>")]);
+    let data = archive(&[("world.sdf", "<sdf version='1.9'><model name='test'/></sdf>")]);
     let server = Server::new(move |_| {
         (
             200,
@@ -489,36 +500,15 @@ fn download_rejects_bad_archives_content_types_and_links() {
         let a = server.args(temp.path(), "models");
         assert_eq!(dispatch("client.download", &a)["result"], 7);
     }
-    let bad = json!({"status":200,"headers":{"Content-Type":"text/plain"},"data":"ftp://example.com".as_bytes()});
-    assert!(
-        zip_bytes(
-            &Value::Null,
-            crate::io::Response {
-                status: bad["status"].as_u64().unwrap_or(200) as u16,
-                headers: bad["headers"]
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").into()))
-                    .collect(),
-                data: vec![],
-                error: None
-            }
+    let server = Server::new(|_| {
+        (
+            200,
+            vec![("Content-Type".into(), "text/plain".into())],
+            b"ftp://example.com/archive.zip".to_vec(),
         )
-        .is_none()
-    );
-    assert!(
-        zip_bytes(
-            &Value::Null,
-            crate::io::Response {
-                status: 404,
-                headers: Default::default(),
-                data: vec![],
-                error: None
-            }
-        )
-        .is_none()
-    );
+    });
+    let a = server.args(temp.path(), "models");
+    assert_eq!(dispatch("client.download", &a)["result"], 7);
 }
 #[test]
 fn model_download_dependencies_cycles_and_invalid_metadata() {
@@ -566,7 +556,7 @@ fn indirect_download_follows_valid_link_and_rejects_cycles() {
     let temp = tempfile::tempdir().unwrap();
     let address = Arc::new(Mutex::new(String::new()));
     let addr = address.clone();
-    let payload = archive(&[("world.sdf", "<sdf/>")]);
+    let payload = archive(&[("world.sdf", "<sdf version='1.9'><model name='test'/></sdf>")]);
     let server = Server::new(move |r| {
         if Server::path(r) == "/blob" {
             (
@@ -603,7 +593,11 @@ fn upload_patch_fields_files_and_licenses() {
     let dir = temp.path().join("upload");
     fs::create_dir_all(dir.join("meshes")).unwrap();
     fs::write(dir.join("meshes/mesh.stl"), "solid mesh").unwrap();
-    fs::write(dir.join("model.sdf"), "<sdf/>").unwrap();
+    fs::write(
+        dir.join("model.sdf"),
+        "<sdf version='1.9'><model name='test'/></sdf>",
+    )
+    .unwrap();
     fs::write(dir.join("metadata.pbtxt"),r#"name: "Box" description: "Test" model { file: "model.sdf" } legal { license: "Apache-2.0" } tags: "one" categories { first: "a" second: "b" } annotations { key: "k" value: "v" }"#).unwrap();
     let server = Server::new(|r| {
         if Server::path(r).ends_with("licenses") {
@@ -670,7 +664,7 @@ fn upload_patch_fields_files_and_licenses() {
 #[test]
 fn update_worlds_fetches_newer_version_and_reports_server_failure() {
     let temp = tempfile::tempdir().unwrap();
-    let payload = archive(&[("world.sdf", "<sdf/>")]);
+    let payload = archive(&[("world.sdf", "<sdf version='1.9'><model name='test'/></sdf>")]);
     let server = Server::new(move |r| {
         if Server::path(r).contains(".zip") {
             (
@@ -686,7 +680,7 @@ fn update_worlds_fetches_newer_version_and_reports_server_failure() {
         }
     });
     let a = server.args(temp.path(), "worlds");
-    let initial = archive(&[("world.sdf", "old")]);
+    let initial = archive(&[("world.sdf", "<sdf/>")]);
     assert_eq!(
         io(
             "io.cache_save",
@@ -701,7 +695,7 @@ fn update_worlds_fetches_newer_version_and_reports_server_failure() {
     assert_eq!(
         io(
             "io.cache_save",
-            json!({"config":b["config"],"kind":"worlds","id":b["id"],"data":archive(&[("world.sdf","old")])})
+            json!({"config":b["config"],"kind":"worlds","id":b["id"],"data":archive(&[("world.sdf","<sdf/>")])})
         )["ok"],
         true
     );
@@ -857,7 +851,7 @@ fn cached_file_rejects_symlink_escape() {
     let mut a = server.args(temp.path(), "worlds");
     let saved = io(
         "io.cache_save",
-        json!({"config":a["config"],"kind":"worlds","id":a["id"],"data":archive(&[("world.sdf","world")])}),
+        json!({"config":a["config"],"kind":"worlds","id":a["id"],"data":archive(&[("world.sdf","<sdf/>")])}),
     );
     assert_eq!(saved["ok"], true);
     let outside = temp.path().join("outside");
@@ -868,4 +862,676 @@ fn cached_file_rejects_symlink_escape() {
         server.url
     ));
     assert_eq!(dispatch("client.cached_file", &a)["result"], 7);
+}
+
+#[test]
+fn private_details_and_content_only_edits_preserve_visibility_and_sparse_fields() {
+    let cache = tempfile::tempdir().unwrap();
+    let model = tempfile::tempdir().unwrap();
+    fs::write(
+        model.path().join("metadata.pbtxt"),
+        "name:\"private\" model {file:\"model.sdf\"}",
+    )
+    .unwrap();
+    fs::write(
+        model.path().join("model.sdf"),
+        "<sdf version='1.9'><model name='private'/></sdf>",
+    )
+    .unwrap();
+    let server = Server::new(|request| {
+        if request.starts_with("GET ") {
+            reply(
+                200,
+                r#"{"name":"private","owner":"alice","private":true,"version":2,"description":"keep","license_name":"MIT"}"#,
+            )
+        } else {
+            reply(200, "{}")
+        }
+    });
+    let config = cache.path().join("config.yaml");
+    fs::write(
+        &config,
+        format!(
+            "servers:\n - url: {}\n   private-token: secret\ncache:\n path: {}\n",
+            server.url,
+            cache.path().display()
+        ),
+    )
+    .unwrap();
+    let native = crate::FuelClient::new(
+        crate::core::load_config(&crate::ClientConfig::default(), &config).unwrap(),
+    );
+    let id = native
+        .parse(
+            &format!("{}/1.0/alice/models/private", server.url),
+            crate::ResourceKind::Model,
+        )
+        .unwrap();
+    assert!(
+        native
+            .details(crate::ResourceKind::Model, &id, &[])
+            .unwrap()
+            .private
+    );
+    let result = crate::command::run(
+        &json!({"action":"edit","url":format!("{}/1.0/alice/models/private",server.url),"config_file":config,"path":model.path()}),
+    );
+    assert_eq!(result["ok"], true, "{result}");
+    let requests = server.requests.lock().unwrap();
+    let patch = requests
+        .iter()
+        .find(|request| request.starts_with("PATCH "))
+        .unwrap();
+    assert!(patch.contains("name=\"private\"\r\n\r\n1\r\n"));
+    assert!(!patch.contains("name=\"license\""));
+    assert!(!patch.contains("name=\"description\""));
+}
+
+#[test]
+fn cli_explicit_endpoint_uses_matching_configured_credentials() {
+    let folder = tempfile::tempdir().unwrap();
+    fs::write(
+        folder.path().join("metadata.pbtxt"),
+        "name:\"sample\" model{file:\"model.sdf\"}",
+    )
+    .unwrap();
+    fs::write(
+        folder.path().join("model.sdf"),
+        "<sdf version='1.9'><model name='sample'/></sdf>",
+    )
+    .unwrap();
+    let server = Server::new(|request| {
+        if !request
+            .to_ascii_lowercase()
+            .contains("private-token: secret")
+        {
+            return reply(401, "");
+        }
+        if request.starts_with("GET ") {
+            (
+                200,
+                vec![("X-Total-Count".into(), "1".into())],
+                br#"[{"owner":"alice","name":"sample"}]"#.to_vec(),
+            )
+        } else {
+            reply(200, "{}")
+        }
+    });
+    let config = folder.path().join("config.yaml");
+    fs::write(
+        &config,
+        format!(
+            "servers:\n - url: {}\n   private-token: secret\ncache:\n path: {}\n",
+            server.url,
+            folder.path().display()
+        ),
+    )
+    .unwrap();
+    for explicit in [false, true] {
+        let mut args = json!({"action":"list","kind":"models","config_file":config});
+        if explicit {
+            args["url"] = json!(server.url);
+        }
+        let result = crate::command::run(&args);
+        assert_eq!(result["ok"], true, "{result}");
+    }
+    let result = crate::command::run(
+        &json!({"action":"upload","url":server.url,"config_file":config,"path":folder.path()}),
+    );
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_non_utf8_directories_configs_and_caches_remain_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let folder = tempfile::tempdir().unwrap();
+    let model = folder
+        .path()
+        .join(OsString::from_vec(b"model-\xff".to_vec()));
+    fs::create_dir(&model).unwrap();
+    fs::write(
+        model.join("metadata.pbtxt"),
+        "name:\"sample\" model{file:\"model.sdf\"}",
+    )
+    .unwrap();
+    fs::write(
+        model.join("model.sdf"),
+        "<sdf version='1.9'><model name='sample'/></sdf>",
+    )
+    .unwrap();
+    let cache = folder
+        .path()
+        .join(OsString::from_vec(b"cache-\xfe".to_vec()));
+    fs::create_dir(&cache).unwrap();
+    let configuration = folder
+        .path()
+        .join(OsString::from_vec(b"configuration-\xfd.yaml".to_vec()));
+    let payload = archive(&[("world.sdf", "<sdf/>")]);
+    let server = Server::new(move |request| {
+        if request.starts_with("GET ") {
+            (200, vec![], payload.clone())
+        } else {
+            reply(200, "{}")
+        }
+    });
+    fs::write(
+        &configuration,
+        format!(
+            "servers:\n - url: {}\n   private-token: secret\n",
+            server.url
+        ),
+    )
+    .unwrap();
+    let mut config = crate::ClientConfig::default();
+    config.load(&configuration).unwrap();
+    assert_eq!(config.config_path, configuration);
+    config.cache_location = cache.clone();
+    let client = crate::FuelClient::new(config);
+    let id = crate::ResourceId {
+        server: crate::ServerConfig {
+            url: server.url.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    client.upload(&model, &id, &[], false, "").unwrap();
+    let fetched = client
+        .fetch(&format!(
+            "{}/1.0/alice/worlds/sample/1/files/world.sdf",
+            server.url
+        ))
+        .unwrap();
+    assert!(fetched.starts_with(&cache));
+    assert_eq!(fs::read_to_string(&fetched).unwrap(), "<sdf/>");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("filename=\"model.sdf\""));
+}
+
+#[test]
+fn native_resource_decoder_rejects_bad_shapes_and_numeric_overflow() {
+    use crate::{ErrorKind, ResourceKind, ServerConfig};
+    for value in [
+        json!({}),
+        json!({"name":"x","owner":".."}),
+        json!({"name":"x","owner":"a","private":"true"}),
+    ] {
+        assert!(
+            crate::client_native::decode_resource(
+                value,
+                &ServerConfig::default(),
+                ResourceKind::Model
+            )
+            .is_err()
+        );
+    }
+    for field in ["version", "filesize", "likes", "downloads"] {
+        let mut record = json!({"name":"x","owner":"a"});
+        record[field] = json!(u64::from(u32::MAX) + 1);
+        assert_eq!(
+            crate::client_native::decode_resource(
+                record,
+                &ServerConfig::default(),
+                ResourceKind::Model
+            )
+            .unwrap_err()
+            .kind,
+            ErrorKind::Metadata
+        );
+    }
+    let record = json!({"name":"MyCollection","owner":"OpenRobotics","private":true,"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-02-01T00:00:00Z"});
+    let collection = crate::client_native::decode_resource(
+        record.clone(),
+        &ServerConfig::default(),
+        ResourceKind::Collection,
+    )
+    .unwrap();
+    assert_eq!(collection.name, "MyCollection");
+    assert_eq!(collection.owner, "OpenRobotics");
+    assert!(collection.private);
+    let model = crate::client_native::decode_resource(
+        record,
+        &ServerConfig::default(),
+        ResourceKind::Model,
+    )
+    .unwrap();
+    assert!(model.upload_date > 0);
+    assert!(model.modify_date > model.upload_date);
+}
+
+#[test]
+fn graph_limits_return_structured_failures_for_downloads_batches_and_cached_walks() {
+    let address = Arc::new(Mutex::new(String::new()));
+    let handler_address = address.clone();
+    let server = Server::new(move |request| {
+        let name = if request.contains("/models/box/") {
+            "one"
+        } else {
+            "two"
+        };
+        let dependency = format!(
+            "model{{file:\"model.sdf\"}} dependencies{{uri:\"{}/1.0/alice/models/{name}/2\"}}",
+            handler_address.lock().unwrap()
+        );
+        (200, vec![], model_zip(Some(&dependency)))
+    });
+    *address.lock().unwrap() = server.url.clone();
+    let cache = tempfile::tempdir().unwrap();
+    let args = server.args(cache.path(), "models");
+    let mut config = crate::core::typed_config(&args["config"]).unwrap();
+    config.limits.max_dependency_depth = 0;
+    let id = serde_json::from_value(args["id"].clone()).unwrap();
+    let native = crate::FuelClient::new(config.clone());
+    assert_eq!(
+        native
+            .download(crate::ResourceKind::Model, &id, &[])
+            .unwrap_err()
+            .kind,
+        crate::ErrorKind::Limit
+    );
+    assert_eq!(
+        native.dependencies(&id, true).unwrap_err().kind,
+        crate::ErrorKind::Limit
+    );
+    config.limits.max_dependency_resources = 1;
+    let native = crate::FuelClient::new(config);
+    let results = native.download_many(crate::ResourceKind::Model, &[id.clone(), id.clone()], 2);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].is_ok());
+    assert_eq!(
+        results[1].as_ref().unwrap_err().kind,
+        crate::ErrorKind::Limit
+    );
+    assert_eq!(
+        native
+            .download(crate::ResourceKind::Collection, &id, &[])
+            .unwrap_err()
+            .kind,
+        crate::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        native
+            .delete(crate::ResourceKind::Collection, &id, &[])
+            .unwrap_err()
+            .kind,
+        crate::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn archive_referral_length_depth_and_http_failures_are_bounded() {
+    let address = Arc::new(Mutex::new(String::new()));
+    let handler_address = address.clone();
+    let server = Server::new(move |request| {
+        let page = Server::path(request)
+            .trim_start_matches("/hop/")
+            .parse::<usize>()
+            .unwrap_or(0);
+        (
+            200,
+            vec![("Content-Type".into(), "text/plain".into())],
+            format!("{}/hop/{}", handler_address.lock().unwrap(), page + 1).into_bytes(),
+        )
+    });
+    *address.lock().unwrap() = server.url.clone();
+    let cache = tempfile::tempdir().unwrap();
+    let args = server.args(cache.path(), "models");
+    let config = crate::core::typed_config(&args["config"]).unwrap();
+    let id = serde_json::from_value(args["id"].clone()).unwrap();
+    let native = crate::FuelClient::new(config.clone());
+    assert_eq!(
+        native
+            .download(crate::ResourceKind::Model, &id, &[])
+            .unwrap_err()
+            .kind,
+        crate::ErrorKind::Limit
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 9);
+    let mut small = config;
+    small.limits.max_metadata_bytes = 1;
+    let native = crate::FuelClient::new(small);
+    assert_eq!(
+        native
+            .download(crate::ResourceKind::Model, &id, &[])
+            .unwrap_err()
+            .kind,
+        crate::ErrorKind::Limit
+    );
+    let failed = Server::new(|request| {
+        if request.contains("hop") {
+            reply(503, "")
+        } else {
+            (
+                200,
+                vec![("Content-Type".into(), "text/plain".into())],
+                b"http://127.0.0.1:1/hop".to_vec(),
+            )
+        }
+    });
+    let args = failed.args(cache.path(), "models");
+    assert_eq!(dispatch("client.download", &args)["result"], 7);
+}
+
+#[test]
+fn batch_resolved_tip_self_dependency_is_downloaded_once() {
+    let address = Arc::new(Mutex::new(String::new()));
+    let source = address.clone();
+    let server = Server::new(move |_| {
+        (
+            200,
+            vec![("X-Ign-Resource-Version".into(), "2".into())],
+            model_zip(Some(&format!(
+                "model{{file:\"model.sdf\"}} dependencies{{uri:\"{}/1.0/alice/models/box/2\"}}",
+                source.lock().unwrap()
+            ))),
+        )
+    });
+    *address.lock().unwrap() = server.url.clone();
+    let cache = tempfile::tempdir().unwrap();
+    let args = server.args(cache.path(), "models");
+    let native = crate::FuelClient::new(crate::core::typed_config(&args["config"]).unwrap());
+    let mut id: crate::ResourceId = serde_json::from_value(args["id"].clone()).unwrap();
+    id.version = 0;
+    let results = native.download_many(crate::ResourceKind::Model, &[id], 2);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].is_ok());
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn upload_filesystem_budgets_count_entries_independently_of_metadata_fields() {
+    let folder = tempfile::tempdir().unwrap();
+    fs::write(
+        folder.path().join("metadata.pbtxt"),
+        "name:\"sample\" model{file:\"model.sdf\"}",
+    )
+    .unwrap();
+    fs::write(
+        folder.path().join("model.sdf"),
+        "<sdf><model name='sample'/></sdf>",
+    )
+    .unwrap();
+    let server = Server::new(|_| reply(200, "{}"));
+    let mut config = crate::ClientConfig::default();
+    config.limits.max_archive_entries = 2;
+    let id = crate::ResourceId {
+        server: crate::ServerConfig {
+            url: server.url.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let native = crate::FuelClient::new(config.clone());
+    native.upload(folder.path(), &id, &[], false, "").unwrap();
+    fs::create_dir_all(folder.path().join("one/two")).unwrap();
+    config.limits.max_archive_entries = 100;
+    config.limits.max_archive_depth = 1;
+    let native = crate::FuelClient::new(config);
+    assert_eq!(
+        native
+            .upload(folder.path(), &id, &[], false, "")
+            .unwrap_err()
+            .kind,
+        crate::ErrorKind::Limit
+    );
+    fs::remove_dir_all(folder.path().join("one")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        fs::write(
+            folder.path().join(OsString::from_vec(vec![0xff])),
+            "content",
+        )
+        .unwrap();
+        assert_eq!(
+            native
+                .upload(folder.path(), &id, &[], false, "")
+                .unwrap_err()
+                .kind,
+            crate::ErrorKind::InvalidInput
+        );
+    }
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn archive_referrals_apply_the_redirect_downgrade_policy() {
+    use crate::client_native::archive_referral;
+    assert!(
+        archive_referral("https://fuel.example/archive", "http://cdn.example/archive").is_err()
+    );
+    assert!(
+        archive_referral(
+            "https://fuel.example/archive",
+            "https://cdn.example/archive"
+        )
+        .is_ok()
+    );
+    assert!(archive_referral("http://fuel.example/archive", "https://cdn.example/archive").is_ok());
+    assert!(archive_referral("http://fuel.example/archive", "ftp://cdn.example/archive").is_err());
+    assert!(archive_referral("http://fuel.example/archive", "relative/archive").is_err());
+}
+
+#[test]
+fn batch_resource_allowance_counts_scheduled_nodes_instead_of_resolved_aliases() {
+    for (branches, allowance, expected_requests, complete) in [
+        (false, 2, 2, true),
+        (false, 1, 1, false),
+        (true, 4, 4, true),
+        (true, 3, 3, false),
+    ] {
+        let address = Arc::new(Mutex::new(String::new()));
+        let response_address = address.clone();
+        let server = Server::new(move |request| {
+            let route = Server::path(request);
+            let name = route
+                .split("/models/")
+                .nth(1)
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap();
+            let dependencies: &[&str] = if branches {
+                match name {
+                    "root" => &["left", "right"],
+                    "left" => &["leaf", "root/1"],
+                    "right" => &["leaf", "left/1"],
+                    _ => &[],
+                }
+            } else if name == "root" {
+                &["child"]
+            } else {
+                &[]
+            };
+            let dependencies = dependencies
+                .iter()
+                .map(|name| {
+                    format!(
+                        "dependencies{{uri:\"{}/1.0/alice/models/{name}\"}}",
+                        response_address.lock().unwrap()
+                    )
+                })
+                .collect::<String>();
+            (
+                200,
+                vec![("X-Ign-Resource-Version".into(), "1".into())],
+                model_zip(Some(&format!(
+                    "name:\"{name}\" model{{file:\"model.sdf\"}} {dependencies}"
+                ))),
+            )
+        });
+        *address.lock().unwrap() = server.url.clone();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config =
+            crate::core::typed_config(&server.args(cache.path(), "models")["config"]).unwrap();
+        config.limits.max_dependency_resources = allowance;
+        let client = crate::FuelClient::new(config);
+        let root = client
+            .parse(
+                &format!("{}/1.0/alice/models/root", server.url),
+                crate::ResourceKind::Model,
+            )
+            .unwrap();
+        let results = client.download_many(crate::ResourceKind::Model, &[root], 2);
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            expected_requests,
+            "branches={branches}, allowance={allowance}"
+        );
+        let downloaded = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .collect::<Vec<_>>();
+        assert_eq!(downloaded.len(), expected_requests);
+        let unique = downloaded
+            .iter()
+            .map(|item| item.id.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), expected_requests);
+        if complete {
+            assert!(results.iter().all(Result::is_ok));
+        } else {
+            assert_eq!(
+                results.last().unwrap().as_ref().unwrap_err().kind,
+                crate::ErrorKind::Limit
+            );
+        }
+    }
+}
+
+#[test]
+fn resolved_alias_fanout_fits_its_actual_single_download_budget() {
+    let address = Arc::new(Mutex::new(String::new()));
+    let response_address = address.clone();
+    let server = Server::new(move |request| {
+        let route = Server::path(request);
+        let name = route
+            .split("/models/")
+            .nth(1)
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        let dependencies = if name == "root" {
+            ["a", "a/1", "b", "b/1"]
+                .iter()
+                .map(|name| {
+                    format!(
+                        "dependencies{{uri:\"{}/1.0/alice/models/{name}\"}}",
+                        response_address.lock().unwrap()
+                    )
+                })
+                .collect::<String>()
+        } else {
+            String::new()
+        };
+        (
+            200,
+            vec![("X-Ign-Resource-Version".into(), "1".into())],
+            model_zip(Some(&format!(
+                "name:\"{name}\" model{{file:\"model.sdf\"}} {dependencies}"
+            ))),
+        )
+    });
+    *address.lock().unwrap() = server.url.clone();
+    let cache = tempfile::tempdir().unwrap();
+    let mut config =
+        crate::core::typed_config(&server.args(cache.path(), "models")["config"]).unwrap();
+    config.limits.max_dependency_resources = 3;
+    let client = crate::FuelClient::new(config);
+    let root = client
+        .parse(
+            &format!("{}/1.0/alice/models/root", server.url),
+            crate::ResourceKind::Model,
+        )
+        .unwrap();
+    client
+        .download(crate::ResourceKind::Model, &root, &[])
+        .unwrap();
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn dense_cached_dependency_graph_finishes_with_one_request_per_resource() {
+    let count = 12;
+    let address = Arc::new(Mutex::new(String::new()));
+    let response_address = address.clone();
+    let server = Server::new(move |request| {
+        let route = Server::path(request);
+        let name = route
+            .split("/models/")
+            .nth(1)
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        let dependencies = (0..count)
+            .map(|number| {
+                format!(
+                    "dependencies{{uri:\"{}/1.0/alice/models/node{number}/1\"}}",
+                    response_address.lock().unwrap()
+                )
+            })
+            .collect::<String>();
+        (
+            200,
+            vec![("X-Ign-Resource-Version".into(), "1".into())],
+            model_zip(Some(&format!(
+                "name:\"{name}\" model{{file:\"model.sdf\"}} {dependencies}"
+            ))),
+        )
+    });
+    *address.lock().unwrap() = server.url.clone();
+    let cache = tempfile::tempdir().unwrap();
+    let mut config =
+        crate::core::typed_config(&server.args(cache.path(), "models")["config"]).unwrap();
+    config.limits.max_dependency_resources = count + 1;
+    let dependencies = (0..count)
+        .map(|number| {
+            format!(
+                "dependencies{{uri:\"{}/1.0/alice/models/node{number}/1\"}}",
+                server.url
+            )
+        })
+        .collect::<String>();
+    for number in 0..count {
+        let id = crate::ResourceId {
+            name: format!("node{number}"),
+            owner: "alice".into(),
+            version: 1,
+            server: config.servers[0].clone(),
+            ..Default::default()
+        };
+        let bytes = model_zip(Some(&format!(
+            "name:\"node{number}\" model{{file:\"model.sdf\"}} {dependencies}"
+        )));
+        crate::io::save_resource(
+            &config,
+            crate::ResourceKind::Model,
+            &id,
+            Cursor::new(bytes),
+            true,
+        )
+        .unwrap();
+    }
+    let client = crate::FuelClient::new(config);
+    let root = client
+        .parse(
+            &format!("{}/1.0/alice/models/root", server.url),
+            crate::ResourceKind::Model,
+        )
+        .unwrap();
+    client
+        .download(crate::ResourceKind::Model, &root, &[])
+        .unwrap();
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    server.requests.lock().unwrap().clear();
+    let results = client.download_many(crate::ResourceKind::Model, &[root], 3);
+    assert_eq!(results.len(), count + 1);
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(server.requests.lock().unwrap().len(), count + 1);
 }

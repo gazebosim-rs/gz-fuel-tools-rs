@@ -47,8 +47,8 @@ cache behavior, pagination, binary bodies and every supported HTTP method. An
 independent stored-ZIP fixture in `tests/compatibility.cc` avoids using the archive
 implementation under test to generate every expected input.
 
-The native Rust API has typed public configuration/resource/result values. Shared
-internal dispatch and serialized C++ adaptation are implementation details. The
+The native Rust API has typed public configuration/resource/result values. Typed domain operations serve native callers directly. Serialized JSON control
+messages and separate raw binary buffers serve the internal C++ adapter only. The
 facade preserves C++ source declarations and reference behavior; downstream code
 must be rebuilt. Binary ABI interchangeability with an existing installed Fuel
 library is not asserted.
@@ -80,3 +80,27 @@ were resolved by upgrades/replacement, with no advisory ignores. Package checks
 build from a clean source archive and run relocated external consumers. Gazebo's
 absolute dispatcher manifest is explicitly refreshed after moving an installation;
 this limitation is documented and tested rather than implied to be relocatable.
+
+
+## Clean-context correction review
+
+The follow-up in REVIEW_FIX_PLAN.md resolves all seventeen independent findings.
+The cache owner independently examined the shared pager, opaque C++ cursor and
+transport; the transport owner independently examined cache transactions and
+legacy cache access. Their verified read-only-cache and mixed-case-tip findings
+were fixed and reproduced through the original C++ API.
+
+A further reviewer began with no conversation history and reviewed the typed API,
+identity, metadata, transport and client core. Public-API probes found three more
+issues: too many simultaneously open multipart files, tip aliases consuming a
+batch resource budget, and duplicate queued dependencies causing quadratic memory
+growth. These are covered by isolated descriptor-limit, exact graph-budget and
+dense cyclic-graph regressions. The reviewer inspected all three corrections and independently reran four graph
+regressions; no actionable findings remained in that review scope.
+
+An isolated upstream JSON parser oracle confirmed scalar partial-value mutation
+order and license-overflow skipping; none of that implementation is included in
+production. Original headers, fixtures and assertions remain unchanged. Transport
+uses one async HTTP runtime behind the blocking API; progressing transfers have
+inactivity limits distinct from optional whole-request deadlines. Multipart files
+open lazily and C++ binary bodies avoid JSON arrays.

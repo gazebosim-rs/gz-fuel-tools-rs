@@ -1,5 +1,7 @@
 // Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
+#include <stdexcept>
+
 #include "Bridge.hh"
 #include "LocalCache.hh"
 #include "ModelIterPrivate.hh"
@@ -299,8 +301,14 @@ ModelIter FuelClient::Models(const ServerConfig& s) {
   return static_cast<const FuelClient*>(this)->Models(s);
 }
 ModelIter FuelClient::Models(const ServerConfig& s) const {
-  auto it = ModelIterFactory::Create(dataPtr->rest, s, "models");
-  if (it) return it;
+  // The historical server-wide overload falls back to local resources when
+  // the first remote page cannot be obtained. Later iterator failures remain
+  // explicit, so a partial remote listing cannot silently become a cache list.
+  try {
+    auto it = ModelIterFactory::Create(dataPtr->rest, s, "models");
+    if (it) return it;
+  } catch (const std::runtime_error&) {
+  }
   ModelIdentifier id;
   id.SetServer(s);
   LocalCache c(&dataPtr->config);
@@ -331,8 +339,14 @@ ModelIter FuelClient::Models(const CollectionIdentifier& id) const {
                                   rs::call("client.list_path", a).asString());
 }
 WorldIter FuelClient::Worlds(const ServerConfig& s) const {
-  auto it = WorldIterFactory::Create(dataPtr->rest, s, "worlds");
-  if (it) return it;
+  // The historical server-wide overload falls back to local resources when
+  // the first remote page cannot be obtained. Later iterator failures remain
+  // explicit, so a partial remote listing cannot silently become a cache list.
+  try {
+    auto it = WorldIterFactory::Create(dataPtr->rest, s, "worlds");
+    if (it) return it;
+  } catch (const std::runtime_error&) {
+  }
   WorldIdentifier id;
   id.SetServer(s);
   LocalCache c(&dataPtr->config);

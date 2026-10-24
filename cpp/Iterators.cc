@@ -58,14 +58,15 @@ IterRestIds::IterRestIds(const Rest& r, const ServerConfig& s, const std::string
 void IterRestIds::Next() {
   if (idIter != ids.end()) ++idIter;
   if (idIter == ids.end()) {
-    if (currentPage && ids.empty()) return;
-    Json::Value a;
-    a["server"] = rs::encode(config);
-    a["path"] = api;
-    a["kind"] = "models";
-    a["page"] = Json::UInt64(++currentPage);
-    a["user_agent"] = rest.UserAgent();
-    const auto values = rs::call("command.page", a);
+    if (!pager) {
+      Json::Value a;
+      a["server"] = rs::encode(config);
+      a["path"] = api;
+      a["kind"] = "models";
+      a["user_agent"] = rest.UserAgent();
+      pager = std::make_unique<rs::Pager>(a);
+    }
+    const auto values = pager->Next();
     ids.clear();
     for (const auto& v : values) {
       ModelIdentifier id;
@@ -124,14 +125,15 @@ WorldIterRestIds::WorldIterRestIds(const Rest& r, const ServerConfig& s, const s
 void WorldIterRestIds::Next() {
   if (idIter != ids.end()) ++idIter;
   if (idIter == ids.end()) {
-    if (page && ids.empty()) return;
-    Json::Value a;
-    a["server"] = rs::encode(config);
-    a["path"] = path;
-    a["kind"] = "worlds";
-    a["page"] = Json::UInt64(++page);
-    a["user_agent"] = rest.UserAgent();
-    const auto values = rs::call("command.page", a);
+    if (!pager) {
+      Json::Value a;
+      a["server"] = rs::encode(config);
+      a["path"] = path;
+      a["kind"] = "worlds";
+      a["user_agent"] = rest.UserAgent();
+      pager = std::make_unique<rs::Pager>(a);
+    }
+    const auto values = pager->Next();
     ids.clear();
     for (const auto& v : values) {
       WorldIdentifier id;

@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 //! Command operations and resource metadata conversion, shared by all frontends.
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{collections::BTreeSet, fs};
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
     v[k].as_str().unwrap_or("")
@@ -10,357 +10,16 @@ fn call(op: &str, a: &Value) -> Value {
     crate::execute(op, a).unwrap_or(Value::Null)
 }
 
-#[derive(Debug, PartialEq)]
-enum Token {
-    Word(String),
-    Text(String),
-    Open,
-    Close,
-    Colon,
-}
-fn tokens(input: &str) -> Result<Vec<Token>, String> {
-    let mut out = Vec::new();
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            c if c.is_whitespace() || c == ',' || c == ';' => {}
-            '#' => {
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut closed = false;
-                while let Some(c) = chars.next() {
-                    if c == '*' && chars.peek() == Some(&'/') {
-                        chars.next();
-                        closed = true;
-                        break;
-                    }
-                }
-                if !closed {
-                    return Err("Unterminated block comment".into());
-                }
-            }
-            '{' | '<' => out.push(Token::Open),
-            '}' | '>' => out.push(Token::Close),
-            ':' => out.push(Token::Colon),
-            '"' | '\'' => {
-                let mut text = Vec::new();
-                let mut closed = false;
-                while let Some(x) = chars.next() {
-                    if x == c {
-                        closed = true;
-                        break;
-                    }
-                    if x == '\\' {
-                        let n = chars.next().ok_or("Unterminated escape")?;
-                        match n {
-                            'n' => text.push(b'\n'),
-                            'r' => text.push(b'\r'),
-                            't' => text.push(b'\t'),
-                            'a' => text.push(7),
-                            'b' => text.push(8),
-                            'f' => text.push(12),
-                            'v' => text.push(11),
-                            '\\' => text.push(b'\\'),
-                            '\'' => text.push(b'\''),
-                            '"' => text.push(b'"'),
-                            '?' => text.push(b'?'),
-                            '0'..='7' => {
-                                let mut number = n.to_digit(8).unwrap();
-                                for _ in 0..2 {
-                                    if let Some(d) = chars.peek().and_then(|c| c.to_digit(8)) {
-                                        number = number * 8 + d;
-                                        chars.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                text.push(
-                                    u8::try_from(number)
-                                        .map_err(|_| "Octal escape exceeds a byte")?,
-                                );
-                            }
-                            'x' | 'X' => {
-                                let first = chars
-                                    .next()
-                                    .and_then(|c| c.to_digit(16))
-                                    .ok_or("Invalid hex escape")?;
-                                let mut number = first;
-                                if let Some(d) = chars.peek().and_then(|c| c.to_digit(16)) {
-                                    number = number * 16 + d;
-                                    chars.next();
-                                }
-                                text.push(number as u8);
-                            }
-                            'u' | 'U' => {
-                                let mut number = 0;
-                                for _ in 0..if n == 'u' { 4 } else { 8 } {
-                                    number = number * 16
-                                        + chars
-                                            .next()
-                                            .and_then(|c| c.to_digit(16))
-                                            .ok_or("Invalid Unicode escape")?;
-                                }
-                                let ch = char::from_u32(number).ok_or("Invalid Unicode scalar")?;
-                                text.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
-                            }
-                            _ => return Err("Unsupported text escape".into()),
-                        }
-                    } else {
-                        text.extend_from_slice(x.encode_utf8(&mut [0; 4]).as_bytes());
-                    }
-                }
-                if !closed {
-                    return Err("Unterminated string".into());
-                }
-                out.push(Token::Text(
-                    String::from_utf8(text).map_err(|_| "Metadata string is not UTF-8")?,
-                ));
-            }
-            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' => {
-                let mut word = String::from(c);
-                while chars.peek().is_some_and(|c| {
-                    c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.'
-                }) {
-                    word.push(chars.next().unwrap());
-                }
-                out.push(Token::Word(word));
-            }
-            _ => return Err(format!("Unexpected metadata character {c}")),
-        }
-    }
-    Ok(out)
-}
-fn message(ts: &[Token], index: &mut usize, depth: usize) -> Result<Map<String, Value>, String> {
-    if depth > 64 {
-        return Err("Metadata nesting exceeds 64 levels".into());
-    }
-    let mut out = Map::new();
-    while *index < ts.len() {
-        if ts[*index] == Token::Close {
-            if depth == 0 {
-                return Err("Unexpected closing message".into());
-            }
-            *index += 1;
-            return Ok(out);
-        }
-        let Token::Word(key) = &ts[*index] else {
-            return Err("Expected field name".into());
-        };
-        let key = key.clone();
-        *index += 1;
-        if ts.get(*index) == Some(&Token::Colon) {
-            *index += 1;
-        }
-        let value = match ts.get(*index) {
-            Some(Token::Open) => {
-                *index += 1;
-                Value::Object(message(ts, index, depth + 1)?)
-            }
-            Some(Token::Text(text)) => {
-                let mut text = text.clone();
-                *index += 1;
-                while let Some(Token::Text(next)) = ts.get(*index) {
-                    text.push_str(next);
-                    *index += 1;
-                }
-                json!(text)
-            }
-            Some(Token::Word(word)) => {
-                *index += 1;
-                serde_json::from_str(word).unwrap_or_else(|_| json!(word))
-            }
-            _ => return Err("Expected field value".into()),
-        };
-        if let Some(previous) = out.get_mut(&key) {
-            if !previous.is_array() {
-                *previous = json!([previous.clone()]);
-            }
-            previous.as_array_mut().unwrap().push(value);
-        } else {
-            out.insert(key, value);
-        }
-    }
-    if depth > 0 {
-        Err("Unterminated message".into())
-    } else {
-        Ok(out)
-    }
-}
-fn repeated(v: &Value) -> Vec<Value> {
-    match v {
-        Value::Null => vec![],
-        Value::Array(a) => a.clone(),
-        _ => vec![v.clone()],
-    }
-}
 pub fn parse_pbtxt(input: &str) -> Result<Value, String> {
-    let ts = tokens(input)?;
-    let raw = Value::Object(message(&ts, &mut 0, 0)?);
-    let allowed = [
-        "model",
-        "world",
-        "name",
-        "description",
-        "version",
-        "authors",
-        "legal",
-        "tags",
-        "annotations",
-        "dependencies",
-        "compatibilities",
-        "categories",
-    ];
-    if raw
-        .as_object()
-        .unwrap()
-        .keys()
-        .any(|k| !allowed.contains(&k.as_str()))
-    {
-        return Err("Unknown Fuel metadata field".into());
-    }
-    if raw.get("model").is_some() && raw.get("world").is_some() {
-        return Err("Multiple resource types".into());
-    }
-    for key in ["name", "description"] {
-        if raw.get(key).is_some_and(|v| !v.is_string()) {
-            return Err(format!("Expected string for {key}"));
-        }
-    }
-    if raw.get("version").is_some_and(|v| v.as_i64().is_none()) {
-        return Err("Expected integer version".into());
-    }
-    for (key, fields) in [
-        ("model", vec!["file", "file_format"]),
-        ("world", vec!["file", "file_format"]),
-        ("legal", vec!["copyright", "license"]),
-        ("categories", vec!["first", "second"]),
-    ] {
-        if let Some(value) = raw.get(key) {
-            let obj = value
-                .as_object()
-                .ok_or_else(|| format!("Expected message for {key}"))?;
-            if obj.keys().any(|k| !fields.contains(&k.as_str())) {
-                return Err(format!("Unknown {key} field"));
-            }
-            for (name, value) in obj {
-                if name != "file_format" && !value.is_string() {
-                    return Err(format!("Expected string for {key}.{name}"));
-                }
-                if name == "file_format" && !value.is_object() {
-                    return Err("Expected file format message".into());
-                }
-            }
-        }
-    }
-    for (key, fields) in [
-        ("authors", vec!["name", "email"]),
-        ("dependencies", vec!["uri"]),
-        ("annotations", vec!["key", "value"]),
-    ] {
-        for value in repeated(&raw[key]) {
-            let obj = value
-                .as_object()
-                .ok_or_else(|| format!("Expected {key} message"))?;
-            if obj
-                .iter()
-                .any(|(k, v)| !fields.contains(&k.as_str()) || !v.is_string())
-            {
-                return Err(format!("Invalid {key} field"));
-            }
-        }
-    }
-    if repeated(&raw["tags"]).iter().any(|v| !v.is_string()) {
-        return Err("Expected string tags".into());
-    }
-    let mut result = raw.clone();
-    result["license"] = json!(s(&raw["legal"], "license"));
-    for key in ["tags", "authors", "dependencies", "compatibilities"] {
-        result[key] = json!(repeated(&raw[key]));
-    }
-    let mut annotations = Map::new();
-    for item in repeated(&raw["annotations"]) {
-        let key = s(&item, "key");
-        if !key.is_empty() {
-            annotations.insert(key.into(), json!(s(&item, "value")));
-        }
-    }
-    result["annotations"] = Value::Object(annotations);
-    result["categories"] = json!(
-        ["first", "second"]
-            .iter()
-            .filter_map(|k| raw["categories"][k].as_str())
-            .collect::<Vec<_>>()
-    );
-    Ok(result)
+    crate::metadata::parse_pbtxt(input)
+        .map(|metadata| crate::metadata::compatibility_value(&metadata))
+        .map_err(|error| error.to_string())
 }
-pub fn parse_config(input: &str) -> Result<Value, String> {
-    let doc = roxmltree::Document::parse(input.trim_start()).map_err(|e| e.to_string())?;
-    let root = doc.root_element();
-    if root.tag_name().name() != "model" && root.tag_name().name() != "world" {
-        return Err("Expected model/world configuration".into());
-    }
-    let text = |name: &str| {
-        root.children()
-            .find(|n| n.has_tag_name(name))
-            .and_then(|n| n.text())
-            .unwrap_or("")
-            .trim()
-            .to_owned()
-    };
-    if text("name").is_empty() {
-        return Err("Missing resource name".into());
-    }
-    let kind = root.tag_name().name();
-    let mut result = json!({"name":text("name"),"description":text("description"),"license":text("license"),"version":text("version").chars().take_while(|c|c.is_ascii_digit()||*c=='-'||*c=='+').collect::<String>().parse::<i32>().unwrap_or(0),"tags":[],"categories":[],"annotations":{},"dependencies":[],"authors":[]});
-    let sdf = root
-        .children()
-        .filter(|n| n.has_tag_name("sdf"))
-        .max_by_key(|n| {
-            n.attribute("version")
-                .unwrap_or("")
-                .split('.')
-                .map(|v| v.parse::<u32>().unwrap_or(0))
-                .collect::<Vec<_>>()
-        });
-    if let Some(sdf) = sdf {
-        let numbers = sdf
-            .attribute("version")
-            .unwrap_or("")
-            .split('.')
-            .map(|n| n.parse::<u32>())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "Invalid SDF version")?;
-        if numbers.len() < 2 || sdf.text().unwrap_or("").trim().is_empty() {
-            return Err("Invalid SDF declaration".into());
-        }
-        result[kind] = json!({"file":sdf.text().unwrap_or("").trim(),"file_format":{"name":"sdf","version":{"major":numbers[0],"minor":numbers[1],"patch":numbers.get(2).copied().unwrap_or(0)}}});
-    } else {
-        return Err("Missing SDF declaration".into());
-    }
-    result["dependencies"] = json!(
-        root.children()
-            .filter(|n| n.has_tag_name("depend"))
-            .flat_map(|n| n.descendants().filter(|c| c.has_tag_name("uri")))
-            .filter_map(|n| n.text())
-            .map(|uri| json!({"uri":uri.trim()}))
-            .collect::<Vec<_>>()
-    );
-    result["authors"]=json!(root.children().filter(|n|n.has_tag_name("author")).map(|n|json!({"name":n.children().find(|c|c.has_tag_name("name")).and_then(|c|c.text()).unwrap_or(""),"email":n.children().find(|c|c.has_tag_name("email")).and_then(|c|c.text()).unwrap_or("")})).collect::<Vec<_>>());
-    Ok(result)
+#[cfg(test)]
+fn parse_config(input: &str) -> Result<Value, String> {
+    crate::metadata::parse_config(input)
+        .map(|metadata| crate::metadata::compatibility_value(&metadata))
+        .map_err(|error| error.to_string())
 }
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -418,243 +77,74 @@ fn config_text(v: &Value) -> Result<String, String> {
     ));
     Ok(out)
 }
-fn pbtxt_text(v: &Value) -> String {
-    let q = |s: &str| serde_json::to_string(s).unwrap();
-    let kind = if v.get("world").is_some() {
-        "world"
+#[cfg(test)]
+use crate::pagination::link_has_next;
+fn listing_settings(
+    a: &Value,
+) -> Result<
+    (
+        crate::ClientConfig,
+        crate::ServerConfig,
+        crate::ResourceKind,
+        Vec<String>,
+    ),
+    String,
+> {
+    let mut config = if a["config"].is_object() {
+        crate::core::typed_config(&a["config"]).map_err(|error| error.to_string())?
     } else {
-        "model"
+        crate::ClientConfig::default()
     };
-    let mut out = format!(
-        "{kind} {{\n  file: {}\n  file_format {{ name: \"sdf\" version {{ major: {} minor: {} patch: {} }} }}\n}}\nname: {}\ndescription: {}\nversion: {}\n",
-        q(s(&v[kind], "file")),
-        v[kind]["file_format"]["version"]["major"]
-            .as_u64()
-            .unwrap_or(1),
-        v[kind]["file_format"]["version"]["minor"]
-            .as_u64()
-            .unwrap_or(6),
-        v[kind]["file_format"]["version"]["patch"]
-            .as_u64()
-            .unwrap_or(0),
-        q(s(v, "name")),
-        q(s(v, "description")),
-        v["version"].as_i64().unwrap_or(0)
-    );
-    for a in v["authors"].as_array().unwrap_or(&vec![]) {
-        out.push_str(&format!(
-            "authors {{ name: {} email: {} }}\n",
-            q(s(a, "name")),
-            q(s(a, "email"))
-        ));
+    if let Some(user_agent) = a["user_agent"].as_str() {
+        config.user_agent = user_agent.into();
     }
-    for dep in v["dependencies"].as_array().unwrap_or(&vec![]) {
-        out.push_str(&format!("dependencies {{ uri: {} }}\n", q(s(dep, "uri"))));
-    }
-    out
-}
-/// Fetch a listing page while preserving transport, encoding and schema errors.
-pub(crate) struct ListingPage {
-    pub items: Value,
-    pub total: Option<usize>,
-    pub has_next: Option<bool>,
-}
-impl ListingPage {
-    pub(crate) fn complete(&self, received: usize, total: Option<usize>) -> Result<bool, String> {
-        let empty = self.items.as_array().is_some_and(Vec::is_empty);
-        if total.is_some_and(|total| {
-            received > total
-                || ((empty || self.has_next == Some(false)) && received < total)
-                || (self.has_next == Some(true) && received == total)
-        }) {
-            return Err("Fuel listing disagrees with its advertised total count".into());
-        }
-        if empty && self.has_next == Some(true) {
-            return Err("Fuel listing returned an empty page with a next link".into());
-        }
-        Ok(empty || self.has_next == Some(false) || total == Some(received))
-    }
+    let server = serde_json::from_value::<crate::ServerConfig>(a["server"].clone())
+        .map_err(|error| error.to_string())?;
+    let kind = match s(a, "kind") {
+        "models" => crate::ResourceKind::Model,
+        "worlds" => crate::ResourceKind::World,
+        "collections" => crate::ResourceKind::Collection,
+        _ => return Err("Invalid Fuel resource type".into()),
+    };
+    let headers = a["headers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    Ok((config, server, kind, headers))
 }
 pub fn list_page(a: &Value) -> Result<Value, String> {
-    list_page_with_metadata(a).map(|page| page.items)
-}
-// Split Link field lists/parameters only outside URI references and quoted
-// strings. A quoted title can legally contain commas, semicolons and escapes.
-fn link_parts(value: &str, separator: char) -> Result<Vec<&str>, String> {
-    let (mut angle, mut quoted, mut escaped) = (false, false, false);
-    let mut parts = vec![];
-    let mut start = 0;
-    for (index, character) in value.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if quoted {
-            match character {
-                '\\' => escaped = true,
-                '"' => quoted = false,
-                _ => {}
-            }
-        } else if angle {
-            if character == '>' {
-                angle = false;
-            } else if character == '<' {
-                return Err("Invalid nested URI in Fuel Link header".into());
-            }
-        } else {
-            match character {
-                '<' => angle = true,
-                '>' => return Err("Invalid URI in Fuel Link header".into()),
-                '"' => quoted = true,
-                delimiter if delimiter == separator => {
-                    parts.push(&value[start..index]);
-                    start = index + character.len_utf8();
-                }
-                _ => {}
-            }
-        }
-    }
-    if angle || quoted || escaped {
-        return Err("Unterminated URI or quoted string in Fuel Link header".into());
-    }
-    parts.push(&value[start..]);
-    Ok(parts)
-}
-fn link_has_next(value: &str) -> Result<bool, String> {
-    let mut next = false;
-    for link in link_parts(value, ',')? {
-        let parts = link_parts(link, ';')?;
-        let target = parts[0].trim();
-        if !target.starts_with('<') || !target.ends_with('>') || target.len() <= 2 {
-            return Err("Invalid target in Fuel Link header".into());
-        }
-        let mut relation = None;
-        for parameter in &parts[1..] {
-            let Some((name, value)) = parameter.split_once('=') else {
-                if parameter.trim().eq_ignore_ascii_case("rel") {
-                    return Err("Missing Fuel Link relation value".into());
-                }
-                // RFC Link extensions may be bare parameters without a value.
-                continue;
-            };
-            if !name.trim().eq_ignore_ascii_case("rel") {
-                continue;
-            }
-            if relation.is_some() {
-                return Err("Repeated relation in Fuel Link header".into());
-            }
-            let value = value.trim();
-            let value = if value.starts_with('"') {
-                let quoted = value
-                    .strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-                    .ok_or("Invalid quoted Fuel Link relation")?;
-                let mut decoded = String::new();
-                let mut characters = quoted.chars();
-                while let Some(character) = characters.next() {
-                    decoded.push(if character == '\\' {
-                        characters
-                            .next()
-                            .ok_or("Invalid escape in Fuel Link relation")?
-                    } else {
-                        character
-                    });
-                }
-                decoded
-            } else {
-                value.to_owned()
-            };
-            if value.is_empty() {
-                return Err("Empty relation in Fuel Link header".into());
-            }
-            relation = Some(
-                value
-                    .split_whitespace()
-                    .any(|item| item.eq_ignore_ascii_case("next")),
-            );
-        }
-        next |= relation.ok_or("Missing relation in Fuel Link header")?;
-    }
-    Ok(next)
-}
-pub(crate) fn list_page_with_metadata(a: &Value) -> Result<ListingPage, String> {
-    let mut headers = a["headers"].as_array().cloned().unwrap_or_default();
-    headers.push(json!("Accept: application/json"));
-    let headers = call(
-        "client.headers",
-        &json!({"headers":headers,"id":{"server":a["server"]}}),
-    );
-    let response = crate::io::transport(
-        &json!({"method":0,"url":a["server"]["url"],"version":a["server"]["version"],"path":s(a,"path").replace('\\',"/"),"path_encoded":a["path_encoded"],"query":[format!("page={}",a["page"].as_u64().unwrap_or(1))],"headers":headers,"data":[],"form":[],"user_agent":a["user_agent"]}),
-    );
-    if let Some(error) = response.error {
-        return Err(format!("Fuel listing request failed: {error}"));
-    }
-    if response.status != 200 {
-        return Err(format!("Fuel listing returned HTTP {}", response.status));
-    }
-    let text =
-        std::str::from_utf8(&response.data).map_err(|e| format!("Invalid UTF-8 listing: {e}"))?;
-    let mut records: Value =
-        serde_json::from_str(text).map_err(|e| format!("Invalid JSON listing: {e}"))?;
-    let parts: Vec<_> = s(a, "path").split('/').filter(|p| !p.is_empty()).collect();
-    let detail = parts.len() == 3 && matches!(parts[1], "models" | "worlds");
-    if records.is_object() && detail {
-        records = json!([records]);
-    }
-    let items = records.as_array().ok_or("Fuel listing is not an array")?;
-    if items
-        .iter()
-        .any(|item| !item.is_object() || item["name"].as_str().is_none())
-    {
-        return Err("Fuel listing contains an invalid resource record".into());
-    }
-    let total = response
-        .headers
-        .get("x-total-count")
-        .and_then(|value| value.parse().ok());
-    let has_next = response
-        .headers
-        .get("link")
-        .map(|links| link_has_next(links))
-        .transpose()?;
-    let items = call(
-        "json_parse",
-        &json!({"text":records.to_string(),"kind":a["kind"],"server":a["server"],"many":true}),
-    );
-    Ok(ListingPage {
-        items,
-        total,
-        has_next,
-    })
+    let (config, server, kind, headers) = listing_settings(a)?;
+    crate::client::ClientCore::new(&config)
+        .list_page(
+            kind,
+            &server,
+            s(a, "path"),
+            a["page"].as_u64().unwrap_or(1) as u32,
+            &headers,
+        )
+        .map(|page| json!(page.items))
+        .map_err(|error| error.to_string())
 }
 fn page(a: &Value) -> Value {
     list_page(a).unwrap_or_else(|_| json!([]))
 }
-
 fn listing(a: &Value) -> Result<Value, String> {
-    let mut out = vec![];
-    let mut seen = BTreeSet::new();
-    let mut args = a.clone();
-    let mut total = None;
-    for n in 1..=10000 {
-        args["page"] = json!(n);
-        let page = list_page_with_metadata(&args)?;
-        let ids = page
-            .items
-            .as_array()
-            .ok_or("Fuel listing is not an array")?;
-        total = page.total.or(total);
-        let fingerprint = serde_json::to_string(ids).unwrap_or_default();
-        if !seen.insert(fingerprint) {
-            return Err("Fuel server repeated a listing page".into());
-        }
-        out.extend(ids.iter().cloned());
-        // Fuel responds with 404 beyond its final page. Honor its advertised
-        // boundary instead of probing past it or treating arbitrary errors as EOF.
-        if page.complete(out.len(), total)? {
-            return Ok(json!(out));
-        }
+    let (config, server, kind, headers) = listing_settings(a)?;
+    let mut pager = crate::pagination::Pager::new(
+        config,
+        kind,
+        server,
+        s(a, "path").replace('\\', "/"),
+        headers,
+    );
+    let mut items = vec![];
+    while let Some(page) = pager.next_page().map_err(|error| error.to_string())? {
+        items.extend(page);
     }
-    Err("Fuel listing exceeded the page limit".into())
+    Ok(json!(items))
 }
 
 fn truth(v: &str) -> bool {
@@ -698,7 +188,15 @@ pub fn run(a: &Value) -> Value {
             if url::Url::parse(url).is_err() {
                 return finish(false, format!("Invalid URL [{url}]\n"));
             }
-            let mut srv = call("server_default", &json!({}));
+            let mut srv = config["servers"]
+                .as_array()
+                .and_then(|servers| {
+                    servers.iter().find(|server| {
+                        s(server, "url").trim_end_matches('/') == url.trim_end_matches('/')
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| call("server_default", &json!({})));
             srv["url"] = json!(url);
             vec![srv]
         };
@@ -718,7 +216,7 @@ pub fn run(a: &Value) -> Value {
                 ));
             }
             let ids = match listing(
-                &json!({"server":server,"path":path,"kind":kind,"user_agent":config["user_agent"],"headers":args["headers"]}),
+                &json!({"config":config,"server":server,"path":path,"kind":kind,"user_agent":config["user_agent"],"headers":args["headers"]}),
             ) {
                 Ok(ids) => ids,
                 Err(error) => return finish(false, format!("{error}\n")),
@@ -774,6 +272,15 @@ pub fn run(a: &Value) -> Value {
             if url::Url::parse(s(a, "url")).is_err() {
                 return finish(false, "Invalid URL\n".into());
             }
+            id["server"] = config["servers"]
+                .as_array()
+                .and_then(|servers| {
+                    servers.iter().find(|server| {
+                        s(server, "url").trim_end_matches('/') == s(a, "url").trim_end_matches('/')
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| call("server_default", &json!({})));
             id["server"]["url"] = a["url"].clone();
         }
         args["id"] = id;
@@ -838,7 +345,7 @@ pub fn run(a: &Value) -> Value {
                             s(&parsed["id"], "name")
                         );
                         let ids = match listing(
-                            &json!({"server":parsed["id"]["server"],"path":path,"kind":sub,"user_agent":config["user_agent"],"headers":args["headers"]}),
+                            &json!({"config":config,"server":parsed["id"]["server"],"path":path,"kind":sub,"user_agent":config["user_agent"],"headers":args["headers"]}),
                         ) {
                             Ok(ids) => ids,
                             Err(error) => return finish(false, format!("{error}\n")),
@@ -905,9 +412,9 @@ pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
         "command.list" => listing(a).unwrap_or_else(|error| json!({"error":error})),
         "command.config_to_pbtxt" => match fs::read_to_string(s(a, "path"))
             .map_err(|e| e.to_string())
-            .and_then(|s| parse_config(&s))
+            .and_then(|s| crate::metadata::parse_config(&s).map_err(|error| error.to_string()))
         {
-            Ok(v) => json!({"ok":true,"output":pbtxt_text(&v)}),
+            Ok(v) => json!({"ok":true,"output":v.pbtxt()}),
             Err(e) => json!({"ok":false,"output":e}),
         },
         "command.pbtxt_to_config" => match fs::read_to_string(s(a, "path"))
@@ -925,6 +432,28 @@ pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cli_honors_configured_pagination_budget_with_explicit_endpoint() {
+        let server = crate::client::tests::Server::new(|_| {
+            (
+                200,
+                vec![],
+                br#"[{"owner":"alice","name":"sample"}]"#.to_vec(),
+            )
+        });
+        let folder = tempfile::tempdir().unwrap();
+        let config = folder.path().join("limits.yaml");
+        fs::write(
+            &config,
+            format!("servers:\n - url: {}\nlimits:\n max_pages: 1\n", server.url),
+        )
+        .unwrap();
+        let output =
+            run(&json!({"action":"list","kind":"models","url":server.url,"config_file":config}));
+        assert_eq!(output["ok"], false);
+        assert!(s(&output, "output").contains("limit"));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
     #[test]
     fn metadata() {
         let v=parse_pbtxt("name: \"A\" tags: \"one\" tags: \"two\" model {file: \"model.sdf\"} legal {license: \"MIT\"} annotations {key: \"k\" value: \"v\"} dependencies {uri: \"http://fuel/x\"} categories {first: \"robots\"}").unwrap();
@@ -962,7 +491,7 @@ mod tests {
     fn conversion_roundtrip() {
         let v=parse_config("<model><name>A &amp; B</name><version>2</version><sdf version='1.6'>a.sdf</sdf><sdf version='1.10'>b.sdf</sdf><author><name>N</name><email>e</email></author><description>d</description></model>").unwrap();
         assert_eq!(v["model"]["file"], "b.sdf");
-        let pb = pbtxt_text(&v);
+        let pb = crate::metadata::parse_config("<model><name>A &amp; B</name><version>2</version><sdf version='1.10'>b.sdf</sdf><author><name>N</name><email>e</email></author><description>d</description></model>").unwrap().pbtxt();
         let parsed = parse_pbtxt(&pb).unwrap();
         assert_eq!(parsed["name"], "A & B");
         let xml = config_text(&parsed).unwrap();
@@ -1292,7 +821,11 @@ mod tests {
             "name: \"B\" model {file: \"model.sdf\"}",
         )
         .unwrap();
-        fs::write(model.join("model.sdf"), "<sdf/>").unwrap();
+        fs::write(
+            model.join("model.sdf"),
+            "<sdf version='1.9'><model name='test'/></sdf>",
+        )
+        .unwrap();
         assert_eq!(
             run(
                 &json!({"action":"upload","url":url,"path":model,"header":"Private-Token: secret","owner":"owner","private":"true"})
@@ -1345,7 +878,9 @@ mod tests {
         writer
             .start_file("model.sdf", zip::write::SimpleFileOptions::default())
             .unwrap();
-        writer.write_all(b"<sdf/>").unwrap();
+        writer
+            .write_all(b"<sdf version='1.9'><model name='test'/></sdf>")
+            .unwrap();
         writer
             .start_file("metadata.pbtxt", zip::write::SimpleFileOptions::default())
             .unwrap();
@@ -1393,10 +928,7 @@ mod tests {
             (r#"name: "\u00e9\U0001F600""#, "é😀"),
             (r#"name: "\101\1\12\x4\x41""#, "A\u{1}\n\u{4}A"),
             (r#"name: "\a\b\f\v\?""#, "\u{7}\u{8}\u{c}\u{b}?"),
-            (
-                "// comment\nname: 'literal é' /* block\ncomment */ # trailing\n",
-                "literal é",
-            ),
+            ("# comment\nname: 'literal é' # trailing\n", "literal é"),
         ] {
             assert_eq!(parse_pbtxt(input).unwrap()["name"], expected, "{input}");
         }
@@ -1414,8 +946,6 @@ mod tests {
             assert!(parse_pbtxt(input).is_err(), "{input}");
         }
         let nested = format!("{}{}", "nested {".repeat(65), "}".repeat(65));
-        assert!(parse_pbtxt(&nested).unwrap_err().contains("64"));
-        let ts = tokens(&format!("{}{}", "nested {".repeat(64), "}".repeat(64))).unwrap();
-        assert!(message(&ts, &mut 0, 0).is_ok());
+        assert!(parse_pbtxt(&nested).is_err());
     }
 }

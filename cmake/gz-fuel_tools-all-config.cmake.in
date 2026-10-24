@@ -1,0 +1,7 @@
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(gz-fuel_tools @PROJECT_VERSION@ EXACT)
+set(gz-fuel_tools-all_FOUND TRUE)
+check_required_components(gz-fuel_tools-all)

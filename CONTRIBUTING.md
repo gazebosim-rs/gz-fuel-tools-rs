@@ -16,7 +16,7 @@ and `NOTICE` included in source packages and native installations.
 See [README.md](README.md) for native dependencies and C++ setup, and
 [docs/CI.md](docs/CI.md) for the enforced merge gates. Rust 1.92 is the declared
 minimum and the pinned validation toolchain. Validation scripts require Python
-3.11 or newer. Install `rustfmt`, `clippy`, and `llvm-tools-preview`, then run:
+3.11 or newer and the protobuf compiler (`protobuf-compiler` on Ubuntu) for schema differential tests; ordinary Rust builds do not need it. Install `rustfmt`, `clippy`, and `llvm-tools-preview`, then run:
 
 ```sh
 scripts/install-hooks.sh

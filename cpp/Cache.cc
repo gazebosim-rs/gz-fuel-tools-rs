@@ -21,12 +21,10 @@ Json::Value arguments(const ClientConfig* config, const char* kind) {
   return a;
 }
 Json::Value saveArguments(const ClientConfig* config, const char* kind, const Json::Value& id,
-                          const std::string& data, bool overwrite) {
+                          bool overwrite) {
   auto a = arguments(config, kind);
   a["id"] = id;
   a["overwrite"] = overwrite;
-  a["data"] = Json::Value(Json::arrayValue);
-  for (unsigned char value : data) a["data"].append(static_cast<unsigned>(value));
   return a;
 }
 }  // namespace
@@ -102,14 +100,15 @@ WorldIter LocalCache::MatchingWorlds(const WorldIdentifier& id) const {
 }
 bool LocalCache::SaveModel(const ModelIdentifier& id, const std::string& data, bool overwrite) {
   if (!dataPtr->config) return false;
-  return rs::call("io.cache_save",
-                  saveArguments(dataPtr->config, "models", rs::encode(id), data, overwrite))["ok"]
+  return rs::call_binary("io.cache_save",
+                         saveArguments(dataPtr->config, "models", rs::encode(id), overwrite),
+                         data)["ok"]
       .asBool();
 }
 bool LocalCache::SaveWorld(WorldIdentifier& id, const std::string& data, bool overwrite) {
   if (!dataPtr->config) return false;
-  const auto output = rs::call(
-      "io.cache_save", saveArguments(dataPtr->config, "worlds", rs::encode(id), data, overwrite));
+  const auto output = rs::call_binary(
+      "io.cache_save", saveArguments(dataPtr->config, "worlds", rs::encode(id), overwrite), data);
   if (!output["ok"].asBool()) return false;
   rs::decode(output["id"], id);
   id.SetLocalPath(output["path"].asString());

@@ -8,10 +8,11 @@ new dependency advisories can be detected without a new pull request.
 - **Rust checks**: Rust 1.92 formatting, all-target Clippy with warnings denied,
   all unit/integration tests, and production Rust line coverage strictly above 95%.
   Documentation is built with warnings denied, missing public API documentation
-  is rejected, and doctests run separately.
+  is rejected, and doctests run separately. The embedded upstream protobuf schema
+  and parser corpus are checked against protoc and the built Rust CLI.
 - **C++ compatibility**: builds the pinned Gazebo dependencies on a hosted runner,
   compiles unchanged upstream tests plus supplementary compatibility tests, runs
-  all 21 suites (including inherited disabled service cases), and requires C++
+  all 22 suites (including inherited disabled service cases), and requires C++
   facade line coverage strictly above 95%. It also verifies the crate package and
   builds a clean source archive, installs and relocates the library, and compiles
   external CMake and pkg-config consumers. Candidate packages and checksums are
