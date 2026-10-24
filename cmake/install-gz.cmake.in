@@ -1,0 +1,13 @@
+if(IS_ABSOLUTE "@CMAKE_INSTALL_DATADIR@")
+  set(fuel_data_dir "@CMAKE_INSTALL_DATADIR@")
+else()
+  set(fuel_data_dir "${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_DATADIR@")
+endif()
+if(IS_ABSOLUTE "@CMAKE_INSTALL_LIBDIR@")
+  set(fuel_library_dir "@CMAKE_INSTALL_LIBDIR@")
+else()
+  set(fuel_library_dir "${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_LIBDIR@")
+endif()
+file(MAKE_DIRECTORY "$ENV{DESTDIR}${fuel_data_dir}/gz")
+file(WRITE "$ENV{DESTDIR}${fuel_data_dir}/gz/fuel12.yaml"
+"---\nformat: 1.0.0\nlibrary_name: gz-fuel_tools\nlibrary_version: @PROJECT_VERSION_FULL@\nlibrary_path: ${fuel_library_dir}/ruby/gz/cmdfuel12\ncommands:\n  - fuel: Manage simulation resources.\n---\n")

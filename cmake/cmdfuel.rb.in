@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Gazebo Tools plugin adapter. All command implementation is in Rust.
+class Cmd
+  def execute(args)
+    executable = File.expand_path('@FUEL_BIN_FROM_RUBY@', __dir__)
+    exec executable, *args
+  end
+end

@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/@FUEL_PREFIX_FROM_PC@
+exec_prefix=${prefix}
+libdir=@FUEL_PKG_LIBDIR@
+includedir=@FUEL_PKG_INCLUDEDIR@
+
+Name: gz-fuel_tools
+Description: Gazebo Fuel tools implemented in Rust with C++ compatibility
+Version: @PROJECT_VERSION@
+Requires: gz-common
+Libs: -L${libdir} -lgz-fuel_tools
+Cflags: -I${includedir}

@@ -1,0 +1,5 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(gz-common)
+include("${CMAKE_CURRENT_LIST_DIR}/gz-fuel_tools-targets.cmake")
+check_required_components(gz-fuel_tools)
