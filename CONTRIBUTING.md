@@ -87,3 +87,32 @@ Do not change required check names without updating branch protection.
 Release preparation must follow the release documentation. Publishing artifacts,
 creating a release, or tagging a release requires an explicit release request;
 ordinary implementation work does not authorize publication.
+
+## Rewrite progress reporting
+
+Repository agents maintain this project's record on the public
+[rewrite dashboard](https://gazebosim-rs.github.io/rewrite-progress/). Read the
+[status contract](https://github.com/gazebosim-rs/rewrite-progress/blob/main/status-contract.md)
+before reporting. Update the record when current tasks, accepted work, remaining
+scope, blockers or verification evidence change. Publish only this owner's
+`data/gz-fuel-tools-rs.json` on the tracker's `status` branch through its updater;
+do not edit another repository's report.
+
+Keep the local JSON report under the ignored `coverage/` directory. Use a current
+UTC timestamp, public evidence links and exact measured counts; unknown
+measurements are `null`. Identify the measured revision and link CI for that same
+revision. Explain test and coverage scope, including separate Rust and C++ results,
+and never present working-tree measurements as proof of a pushed commit's CI.
+Exclude credentials, private paths, environment dumps and private user data.
+
+With a sibling checkout of `rewrite-progress`, validate and then publish through
+the existing authenticated `gh` session:
+
+```sh
+python3 ../rewrite-progress/scripts/update-status.py gz-fuel-tools-rs coverage/rewrite-progress.json --dry-run
+python3 ../rewrite-progress/scripts/update-status.py gz-fuel-tools-rs coverage/rewrite-progress.json
+```
+
+Report standalone Fuel readiness separately from consumer integration. `FUEL-01`
+belongs to `gz-sim-rs`; completion of this library does not establish that
+integration's acceptance, and this repository must not mark that packet complete.
