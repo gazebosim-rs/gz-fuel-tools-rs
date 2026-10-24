@@ -51,7 +51,8 @@ fn extract<R: Read + Seek>(reader: R, destination: &Path) -> io::Result<()> {
     // are rejected on every platform, including when creating a Windows cache.
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        let name = entry.name().trim_end_matches('/');
+        let filename = entry.name()?;
+        let name = filename.trim_end_matches('/');
         if !safe_relative(Path::new(name)) || entry.is_symlink() {
             return Err(invalid("unsafe archive entry"));
         }
@@ -60,7 +61,7 @@ fn extract<R: Read + Seek>(reader: R, destination: &Path) -> io::Result<()> {
     fs::create_dir_all(destination)?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
-        let output = destination.join(entry.name());
+        let output = destination.join(entry.name()?.as_ref());
         if entry.is_dir() {
             fs::create_dir_all(output)?;
         } else {
@@ -209,15 +210,15 @@ fn request_inner(a: &Value) -> Result<Response, Box<dyn std::error::Error>> {
         4 | 6 => reqwest::Method::PATCH,
         _ => return Err(invalid("unknown HTTP method").into()),
     };
-    let private_token = a["headers"]
+    // Custom authentication headers have no universal names. Keep every caller
+    // header on its original origin instead of guessing which contain secrets.
+    let caller_headers = a["headers"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(|h| {
-            h.split_once(':')
-                .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("private-token"))
-        });
+        .next()
+        .is_some();
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .connect_timeout(Duration::from_secs(15))
@@ -230,14 +231,14 @@ fn request_inner(a: &Value) -> Result<Response, Box<dyn std::error::Error>> {
                 if previous.scheme() == "https" && next.scheme() != "https" {
                     return attempt.error("HTTPS downgrade redirect refused");
                 }
-                if private_token
+                if caller_headers
                     && (
                         previous.scheme(),
                         previous.host_str(),
                         previous.port_or_known_default(),
                     ) != (next.scheme(), next.host_str(), next.port_or_known_default())
                 {
-                    return attempt.error("cross-origin redirect with private token refused");
+                    return attempt.error("cross-origin redirect with caller headers refused");
                 }
             }
             attempt.follow()
@@ -267,22 +268,16 @@ fn request_inner(a: &Value) -> Result<Response, Box<dyn std::error::Error>> {
                 .as_str()
                 .ok_or_else(|| invalid("invalid form field"))?
                 .to_owned();
-            let value = pair[1]
-                .as_str()
-                .ok_or_else(|| invalid("invalid form value"))?;
-            if let Some(file) = value.strip_prefix('@') {
-                let (path, filename) = file
-                    .split_once(';')
-                    .map(|(p, n)| (p, n.to_owned()))
+            if let Some(path) = pair[1]["file"].as_str() {
+                let filename = pair[1]["filename"]
+                    .as_str()
+                    .map(str::to_owned)
                     .unwrap_or_else(|| {
-                        (
-                            file,
-                            Path::new(file)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned(),
-                        )
+                        Path::new(path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
                     });
                 form = form.part(
                     key,
@@ -291,6 +286,9 @@ fn request_inner(a: &Value) -> Result<Response, Box<dyn std::error::Error>> {
                         .mime_str(mime(path))?,
                 );
             } else {
+                let value = pair[1]
+                    .as_str()
+                    .ok_or_else(|| invalid("invalid form value"))?;
                 form = form.text(key, value.to_owned());
             }
         }
@@ -300,11 +298,18 @@ fn request_inner(a: &Value) -> Result<Response, Box<dyn std::error::Error>> {
     }
     let response = request.send()?;
     let status = response.status().as_u16();
-    let mut headers = std::collections::BTreeMap::new();
+    let mut headers = std::collections::BTreeMap::<String, String>::new();
     for (key, value) in response.headers() {
         // HTTP fields are case insensitive. Keep the conventional names consumed
         // by the historical facade as aliases for old callers.
-        let value = value.to_str()?.trim().to_owned();
+        let mut value = value.to_str()?.trim().to_owned();
+        // Link is a list-valued field. Preserve every field line so a later
+        // rel=prev cannot overwrite rel=next and truncate a paginated listing.
+        if key.as_str() == "link"
+            && let Some(previous) = headers.get("link")
+        {
+            value = format!("{previous}, {value}");
+        }
         headers.insert(key.to_string(), value.clone());
         let conventional = key
             .as_str()
@@ -335,7 +340,22 @@ pub fn transport(a: &Value) -> Response {
     })
 }
 pub fn request(a: &Value) -> Value {
-    let response = transport(a);
+    // The historical Rest API encodes file fields as @path;filename. Keep that
+    // convention at this adapter boundary; internal text is always literal.
+    let mut a = a.clone();
+    if let Some(form) = a["form"].as_array_mut() {
+        for pair in form {
+            if let Some(file) = pair[1].as_str().and_then(|v| v.strip_prefix('@')) {
+                let (path, filename) = file.split_once(';').unwrap_or((file, ""));
+                pair[1] = if filename.is_empty() {
+                    json!({"file":path})
+                } else {
+                    json!({"file":path,"filename":filename})
+                };
+            }
+        }
+    }
+    let response = transport(&a);
     json!({"status":response.status,"headers":response.headers,"data":response.data,"error":response.error})
 }
 
@@ -1138,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn redirects_keep_private_tokens_on_their_origin() {
+    fn redirects_keep_caller_headers_on_their_origin() {
         use crate::client::tests::Server;
         use std::sync::{
             Arc,
@@ -1153,9 +1173,16 @@ mod tests {
         let url = target.url.clone();
         let redirect = Server::new(move |_| (302, vec![("Location".into(), url.clone())], vec![]));
         let mut args = json!({"url":redirect.url,"method":0,"headers":["Private-Token: secret"]});
-        let refused = request(&args);
-        assert_eq!(refused["status"], 0);
-        assert!(!hit.load(Ordering::SeqCst));
+        for header in [
+            "Private-Token: secret",
+            "X-Access-Token: secret",
+            "Authorization: Bearer secret",
+        ] {
+            args["headers"] = json!([header]);
+            let refused = request(&args);
+            assert_eq!(refused["status"], 0);
+            assert!(!hit.load(Ordering::SeqCst));
+        }
         args["headers"] = json!([]);
         assert_eq!(request(&args)["status"], 200);
         assert!(hit.load(Ordering::SeqCst));

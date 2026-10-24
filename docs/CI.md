@@ -2,16 +2,25 @@
 
 Every pull request runs the `CI` workflow on GitHub-hosted Ubuntu 24.04 runners.
 There are no path filters or draft-PR skips. Pushes to main, merge groups and manual
-workflow dispatches run the same checks.
+workflow dispatches run the same checks. The full workflow also runs weekly so
+new dependency advisories can be detected without a new pull request.
 
 - **Rust checks**: Rust 1.92 formatting, all-target Clippy with warnings denied,
   all unit/integration tests, and production Rust line coverage strictly above 95%.
+  Documentation is built with warnings denied, missing public API documentation
+  is rejected, and doctests run separately.
 - **C++ compatibility**: builds the pinned Gazebo dependencies on a hosted runner,
   compiles unchanged upstream tests plus supplementary compatibility tests, runs
   all 21 suites (including inherited disabled service cases), and requires C++
-  facade line coverage strictly above 95%.
+  facade line coverage strictly above 95%. It also verifies the crate package and
+  builds a clean source archive, installs and relocates the library, and compiles
+  external CMake and pkg-config consumers. Candidate packages and checksums are
+  retained as CI artifacts; nothing is published. See [RELEASING.md](../RELEASING.md).
+- **Dependency and workflow policy**: validates workflow syntax and embedded shell
+  with checksum-pinned actionlint and ShellCheck, then uses pinned cargo-deny to
+  check the locked graph against current advisories, license and source policy.
 - **CI required**: runs even when a dependency fails or is skipped. It succeeds only
-  when both test jobs succeed. This is the required merge check.
+  when every required job succeeds. This is the required merge check.
 
 Dependencies are pinned in `scripts/ci/dependencies.lock`. The installed libraries
 are cached by OS, architecture and the hashes of that lock and the build script.
@@ -19,9 +28,16 @@ Dependency tests and unrelated Gazebo components are omitted; Fuel's own complet
 parity suite remains enabled. No self-hosted runner is needed. Coverage and CTest
 logs are retained as workflow artifacts, including on failures.
 
-The workflow grants only contents-read token permissions. PR jobs use ephemeral
+Actions are pinned to full commit SHAs; Dependabot proposes weekly action and
+Cargo updates through ordinary protected PRs. The workflow grants only
+contents-read token permissions. PR jobs use ephemeral
 GitHub-hosted runners and do not receive a repository write credential through
 checkout. Superseded runs for the same PR are canceled.
+
+GitHub vulnerability alerts, Dependabot security fix PRs, secret scanning, secret
+push protection and private vulnerability reporting are enabled. These live
+settings complement the tracked [security policy](../SECURITY.md) and
+[dependency policy](../deny.toml); they do not replace review or tests.
 
 ## Main branch enforcement
 

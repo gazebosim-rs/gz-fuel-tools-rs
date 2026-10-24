@@ -453,7 +453,128 @@ fn pbtxt_text(v: &Value) -> String {
     out
 }
 /// Fetch a listing page while preserving transport, encoding and schema errors.
+pub(crate) struct ListingPage {
+    pub items: Value,
+    pub total: Option<usize>,
+    pub has_next: Option<bool>,
+}
+impl ListingPage {
+    pub(crate) fn complete(&self, received: usize, total: Option<usize>) -> Result<bool, String> {
+        let empty = self.items.as_array().is_some_and(Vec::is_empty);
+        if total.is_some_and(|total| {
+            received > total
+                || ((empty || self.has_next == Some(false)) && received < total)
+                || (self.has_next == Some(true) && received == total)
+        }) {
+            return Err("Fuel listing disagrees with its advertised total count".into());
+        }
+        if empty && self.has_next == Some(true) {
+            return Err("Fuel listing returned an empty page with a next link".into());
+        }
+        Ok(empty || self.has_next == Some(false) || total == Some(received))
+    }
+}
 pub fn list_page(a: &Value) -> Result<Value, String> {
+    list_page_with_metadata(a).map(|page| page.items)
+}
+// Split Link field lists/parameters only outside URI references and quoted
+// strings. A quoted title can legally contain commas, semicolons and escapes.
+fn link_parts(value: &str, separator: char) -> Result<Vec<&str>, String> {
+    let (mut angle, mut quoted, mut escaped) = (false, false, false);
+    let mut parts = vec![];
+    let mut start = 0;
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quoted {
+            match character {
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+        } else if angle {
+            if character == '>' {
+                angle = false;
+            } else if character == '<' {
+                return Err("Invalid nested URI in Fuel Link header".into());
+            }
+        } else {
+            match character {
+                '<' => angle = true,
+                '>' => return Err("Invalid URI in Fuel Link header".into()),
+                '"' => quoted = true,
+                delimiter if delimiter == separator => {
+                    parts.push(&value[start..index]);
+                    start = index + character.len_utf8();
+                }
+                _ => {}
+            }
+        }
+    }
+    if angle || quoted || escaped {
+        return Err("Unterminated URI or quoted string in Fuel Link header".into());
+    }
+    parts.push(&value[start..]);
+    Ok(parts)
+}
+fn link_has_next(value: &str) -> Result<bool, String> {
+    let mut next = false;
+    for link in link_parts(value, ',')? {
+        let parts = link_parts(link, ';')?;
+        let target = parts[0].trim();
+        if !target.starts_with('<') || !target.ends_with('>') || target.len() <= 2 {
+            return Err("Invalid target in Fuel Link header".into());
+        }
+        let mut relation = None;
+        for parameter in &parts[1..] {
+            let Some((name, value)) = parameter.split_once('=') else {
+                if parameter.trim().eq_ignore_ascii_case("rel") {
+                    return Err("Missing Fuel Link relation value".into());
+                }
+                // RFC Link extensions may be bare parameters without a value.
+                continue;
+            };
+            if !name.trim().eq_ignore_ascii_case("rel") {
+                continue;
+            }
+            if relation.is_some() {
+                return Err("Repeated relation in Fuel Link header".into());
+            }
+            let value = value.trim();
+            let value = if value.starts_with('"') {
+                let quoted = value
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .ok_or("Invalid quoted Fuel Link relation")?;
+                let mut decoded = String::new();
+                let mut characters = quoted.chars();
+                while let Some(character) = characters.next() {
+                    decoded.push(if character == '\\' {
+                        characters
+                            .next()
+                            .ok_or("Invalid escape in Fuel Link relation")?
+                    } else {
+                        character
+                    });
+                }
+                decoded
+            } else {
+                value.to_owned()
+            };
+            if value.is_empty() {
+                return Err("Empty relation in Fuel Link header".into());
+            }
+            relation = Some(
+                value
+                    .split_whitespace()
+                    .any(|item| item.eq_ignore_ascii_case("next")),
+            );
+        }
+        next |= relation.ok_or("Missing relation in Fuel Link header")?;
+    }
+    Ok(next)
+}
+pub(crate) fn list_page_with_metadata(a: &Value) -> Result<ListingPage, String> {
     let mut headers = a["headers"].as_array().cloned().unwrap_or_default();
     headers.push(json!("Accept: application/json"));
     let headers = call(
@@ -485,35 +606,54 @@ pub fn list_page(a: &Value) -> Result<Value, String> {
     {
         return Err("Fuel listing contains an invalid resource record".into());
     }
-    Ok(call(
+    let total = response
+        .headers
+        .get("x-total-count")
+        .and_then(|value| value.parse().ok());
+    let has_next = response
+        .headers
+        .get("link")
+        .map(|links| link_has_next(links))
+        .transpose()?;
+    let items = call(
         "json_parse",
         &json!({"text":records.to_string(),"kind":a["kind"],"server":a["server"],"many":true}),
-    ))
+    );
+    Ok(ListingPage {
+        items,
+        total,
+        has_next,
+    })
 }
 fn page(a: &Value) -> Value {
     list_page(a).unwrap_or_else(|_| json!([]))
 }
 
-fn listing(a: &Value) -> Value {
+fn listing(a: &Value) -> Result<Value, String> {
     let mut out = vec![];
     let mut seen = BTreeSet::new();
     let mut args = a.clone();
+    let mut total = None;
     for n in 1..=10000 {
         args["page"] = json!(n);
-        let ids = page(&args);
-        let Some(ids) = ids.as_array() else {
-            break;
-        };
-        if ids.is_empty() {
-            break;
-        }
+        let page = list_page_with_metadata(&args)?;
+        let ids = page
+            .items
+            .as_array()
+            .ok_or("Fuel listing is not an array")?;
+        total = page.total.or(total);
         let fingerprint = serde_json::to_string(ids).unwrap_or_default();
         if !seen.insert(fingerprint) {
-            break;
+            return Err("Fuel server repeated a listing page".into());
         }
         out.extend(ids.iter().cloned());
+        // Fuel responds with 404 beyond its final page. Honor its advertised
+        // boundary instead of probing past it or treating arbitrary errors as EOF.
+        if page.complete(out.len(), total)? {
+            return Ok(json!(out));
+        }
     }
-    json!(out)
+    Err("Fuel listing exceeded the page limit".into())
 }
 
 fn truth(v: &str) -> bool {
@@ -576,9 +716,12 @@ pub fn run(a: &Value) -> Value {
                     s(&server, "url")
                 ));
             }
-            let ids = listing(
-                &json!({"server":server,"path":path,"kind":kind,"user_agent":config["user_agent"]}),
-            );
+            let ids = match listing(
+                &json!({"server":server,"path":path,"kind":kind,"user_agent":config["user_agent"],"headers":args["headers"]}),
+            ) {
+                Ok(ids) => ids,
+                Err(error) => return finish(false, format!("{error}\n")),
+            };
             let mut owners = BTreeSet::new();
             let mut count = 0;
             for id in ids.as_array().unwrap_or(&vec![]) {
@@ -693,9 +836,12 @@ pub fn run(a: &Value) -> Value {
                             s(&parsed["id"], "owner"),
                             s(&parsed["id"], "name")
                         );
-                        let ids = listing(
-                            &json!({"server":parsed["id"]["server"],"path":path,"kind":sub,"user_agent":config["user_agent"]}),
-                        );
+                        let ids = match listing(
+                            &json!({"server":parsed["id"]["server"],"path":path,"kind":sub,"user_agent":config["user_agent"],"headers":args["headers"]}),
+                        ) {
+                            Ok(ids) => ids,
+                            Err(error) => return finish(false, format!("{error}\n")),
+                        };
                         let mut batch = args.clone();
                         batch["kind"] = json!(sub);
                         batch["ids"] = ids;
@@ -755,7 +901,7 @@ pub fn dispatch(op: &str, a: &Value) -> Option<Value> {
     Some(match op {
         "command.run" => run(a),
         "command.page" => page(a),
-        "command.list" => listing(a),
+        "command.list" => listing(a).unwrap_or_else(|error| json!({"error":error})),
         "command.config_to_pbtxt" => match fs::read_to_string(s(a, "path"))
             .map_err(|e| e.to_string())
             .and_then(|s| parse_config(&s))
@@ -923,6 +1069,110 @@ mod tests {
         assert!(requests[0].starts_with("GET /1.0/alice/models?page=1"));
     }
     #[test]
+    fn link_relations_respect_quoted_delimiters_and_reject_ambiguous_metadata() {
+        assert!(
+            link_has_next(r#"<https://host/a,b;c>; title="a\"b, c; rel=prev"; ReL = "PrEv NeXt""#)
+                .unwrap()
+        );
+        assert!(!link_has_next(r#"</page>; title="demo; rel=next"; rel=prev"#).unwrap());
+        assert!(link_has_next(r#"</page>; foo; rel="n\ext""#).unwrap());
+        for malformed in [
+            "",
+            "page; rel=next",
+            "<>; rel=next",
+            "</page>; title=next",
+            "</page>; rel=next; rel=prev",
+            "</page>; rel=\"\"",
+            "</page>; rel",
+            "</page>; rel=\"next\" tail",
+            "</page>; rel=\"next",
+            "</page; rel=next",
+            "<<page>>; rel=next",
+            ">; rel=next",
+        ] {
+            assert!(link_has_next(malformed).is_err(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn listing_and_collection_fail_on_invalid_or_incomplete_pages() {
+        use crate::client::tests::Server;
+        for failure in ["status", "json", "later"] {
+            let server = Server::new(move |request| {
+                if failure == "later" && request.contains("page=1") {
+                    (
+                        200,
+                        vec![],
+                        br#"[{"owner":"a","name":"b","version":2}]"#.to_vec(),
+                    )
+                } else if failure == "json" {
+                    (200, vec![], b"invalid JSON".to_vec())
+                } else {
+                    (503, vec![], b"unavailable".to_vec())
+                }
+            });
+            for action in ["list", "download"] {
+                let url = if action == "list" {
+                    server.url.clone()
+                } else {
+                    format!("{}/1.0/a/collections/c", server.url)
+                };
+                let output = run(&json!({"action":action,"url":url,"kind":"models"}));
+                assert_eq!(output["ok"], false, "{failure}: {output}");
+                assert!(s(&output, "output").contains("listing"));
+                assert!(!s(&output, "output").contains("Download succeeded"));
+            }
+        }
+    }
+
+    #[test]
+    fn listing_and_collection_send_explicit_headers() {
+        use crate::client::tests::{Server, model_zip};
+        let cache = tempfile::tempdir().unwrap();
+        let server = Server::new(|request| {
+            if !request
+                .to_ascii_lowercase()
+                .contains("x-access-token: explicit")
+            {
+                return (401, vec![], vec![]);
+            }
+            if request.contains(".zip") {
+                (200, vec![], model_zip(None))
+            } else if request.contains("page=1") {
+                (
+                    200,
+                    vec![],
+                    br#"[{"owner":"a","name":"b","version":2}]"#.to_vec(),
+                )
+            } else {
+                (200, vec![], b"[]".to_vec())
+            }
+        });
+        let config = cache.path().join("config.yaml");
+        fs::write(
+            &config,
+            format!(
+                "cache:\n  path: {}\nservers:\n  - url: {}\n",
+                cache.path().display(),
+                server.url
+            ),
+        )
+        .unwrap();
+        for action in ["list", "download"] {
+            let url = if action == "list" {
+                server.url.clone()
+            } else {
+                format!("{}/1.0/a/collections/c", server.url)
+            };
+            let output = run(
+                &json!({"action":action,"url":url,"kind":"models","header":"X-Access-Token: explicit","config_file":config}),
+            );
+            assert_eq!(output["ok"], true, "{output}");
+        }
+        assert_eq!(server.requests.lock().unwrap().len(), 5);
+    }
+
+    #[test]
     fn repeated_page_guard_and_server_errors() {
         let (url, stop, thread) = serve(|_| {
             (
@@ -933,7 +1183,7 @@ mod tests {
         });
         let ids =
             listing(&json!({"server":{"url":url,"version":"1.0"},"path":"models","kind":"models"}));
-        assert_eq!(ids.as_array().unwrap().len(), 1);
+        assert!(ids.unwrap_err().contains("repeated"));
         stop.send(()).unwrap();
         assert_eq!(thread.join().unwrap().len(), 2);
         let (url, stop, thread) = serve(|_| (503, b"error".to_vec(), "text/plain"));

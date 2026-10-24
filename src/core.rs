@@ -166,7 +166,7 @@ fn config_load(c: &Value, path: &str) -> Value {
     };
     let mut c = c.clone();
     c["config_path"] = json!(path);
-    let Ok(doc) = serde_yaml::from_str::<Value>(&content) else {
+    let Ok(doc) = serde_saphyr::from_str::<Value>(&content) else {
         return json!({"ok":false,"config":c});
     };
     let mut ok = true;

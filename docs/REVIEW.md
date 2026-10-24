@@ -58,3 +58,25 @@ or macOS support. Live upstream service tests remain sensitive to server changes
 failures must be reported and investigated, never converted into silent skips.
 Catch-all FFI exception handlers protect a failure boundary; normal argument and
 network error paths are tested without adding production fault-injection APIs.
+
+## Development lifecycle review
+
+Three separate reviews examined implementation correctness, CI/security policy,
+and package/release readiness. The primary implementer cross-reviewed code fixes;
+policy and code reviewers also reviewed each other's pagination and workflow work.
+
+Resolved findings include multipart metadata/file ambiguity, caller credential
+forwarding to foreign dependency origins, arbitrary authentication headers on
+redirects, failure-swallowing aggregate listings and skipped cached descendants.
+Full parity exposed serializer quoting and pagination-boundary compatibility
+regressions; both were corrected without changing upstream tests. Further review
+caught repeated Link fields and quoted relation handling that could truncate
+results; native and CLI regressions cover them.
+
+The aggregate CI gate requires success from every dependency, including canceled
+or skipped jobs. Actions are pinned, PR tokens are read-only, checkout credentials
+are disabled, and publishing is separate from validation. Dependency findings
+were resolved by upgrades/replacement, with no advisory ignores. Package checks
+build from a clean source archive and run relocated external consumers. Gazebo's
+absolute dispatcher manifest is explicitly refreshed after moving an installation;
+this limitation is documented and tested rather than implied to be relocatable.

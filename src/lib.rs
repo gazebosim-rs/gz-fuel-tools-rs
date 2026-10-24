@@ -26,6 +26,7 @@ pub(crate) fn execute(op: &str, args: &Value) -> Result<Value, String> {
         .ok_or_else(|| format!("Unknown Fuel operation: {op}"))
 }
 
+#[doc(hidden)]
 #[repr(C)]
 pub struct FuelBuffer {
     pub data: *mut u8,
@@ -54,6 +55,7 @@ fn respond(input: &[u8]) -> Vec<u8> {
 // Keep test symbols distinct from the exported symbols in the CLI's copy of
 // this library so LLVM can merge both binaries' coverage without name clashes.
 #[cfg_attr(not(test), unsafe(no_mangle))]
+#[doc(hidden)]
 pub unsafe extern "C" fn gz_fuel_rs_call(input: *const u8, len: usize) -> FuelBuffer {
     let bytes = if input.is_null() {
         &[]
@@ -74,6 +76,7 @@ pub unsafe extern "C" fn gz_fuel_rs_call(input: *const u8, len: usize) -> FuelBu
 /// # Safety
 /// The buffer must be an unchanged result of `gz_fuel_rs_call`, not previously freed.
 #[cfg_attr(not(test), unsafe(no_mangle))]
+#[doc(hidden)]
 pub unsafe extern "C" fn gz_fuel_rs_free(buffer: FuelBuffer) {
     if !buffer.data.is_null() {
         // SAFETY: buffer retains the allocation and metadata returned by the call.

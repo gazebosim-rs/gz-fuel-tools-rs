@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+//! Integration checks for standalone CLI exit status, output, and configuration.
 use std::process::Command;
 #[test]
 fn standalone_cli_status_and_output() {
@@ -37,7 +38,8 @@ fn configure_honors_cache_environment_and_explicit_relative_file() {
         String::from_utf8_lossy(&output.stdout)
     );
     let config: serde_json::Value =
-        serde_yaml::from_str(&std::fs::read_to_string(cache.join("config.yaml")).unwrap()).unwrap();
+        serde_saphyr::from_str(&std::fs::read_to_string(cache.join("config.yaml")).unwrap())
+            .unwrap();
     assert_eq!(config["cache"]["path"], cache.to_str().unwrap());
     let relative = Command::new(env!("CARGO_BIN_EXE_gz-fuel"))
         .args([
