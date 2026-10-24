@@ -138,5 +138,6 @@ The coverage gate uses the LLVM tools shipped with the active Rust toolchain,
 starts with fresh profiles and counts all production Rust files, including FFI,
 CLI and error paths. Explicit `#[cfg(test)]` modules are excluded. C++ facade line
 coverage is measured and gated independently above 95% with gcov, including inline bridge helpers.
-The CI Rust job runs independently; the C++ job requires a `gazebo` self-hosted
-runner with the matching Gazebo dependencies and pinned upstream test source.
+Both CI jobs run on GitHub-hosted Ubuntu runners; C++ dependencies are built at
+pinned revisions and cached. Every PR must pass the `CI required` gate before
+merging into main, including administrator merges. See [CI and merge policy](docs/CI.md).

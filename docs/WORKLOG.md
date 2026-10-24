@@ -93,3 +93,17 @@
 - Final review/verification records and usage/build documentation are included.
   The project has an active tracked pre-commit hook; no commit or publication was
   requested or performed.
+
+## Pull request CI and merge enforcement
+
+- Inspected the first GitHub Actions run: Rust passed, C++ was indefinitely queued
+  because the workflow requested a nonexistent self-hosted Gazebo runner.
+- Replaced that requirement with hosted Ubuntu 24.04 runners and a reproducible,
+  cached build of pinned gz-cmake/utils/math/common/msgs dependencies.
+- Added an always-running aggregate CI check that requires both language jobs to
+  succeed. Every pull request runs the workflow without file-path filters.
+- Applied main-branch protection requiring PRs, an up-to-date branch and the
+  GitHub Actions-owned CI gate. Administrator enforcement is enabled, with force
+  pushes and deletion disabled. Saved the policy as versioned JSON.
+- Canceled the obsolete queued workflow. Validating the updated workflow through
+  its own pull request before merging the configuration.

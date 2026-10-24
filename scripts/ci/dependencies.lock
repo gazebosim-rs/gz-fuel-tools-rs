@@ -1,0 +1,6 @@
+# Pinned to the Gazebo dependency revisions used for the rewrite's parity tests.
+gz-cmake ca67ea8460fc03da062780805feb01cb20f4e0ba
+gz-utils eafd2035e344eeb28ccab03409093637b89bee35
+gz-math 1316ed334f4d5bda7be59aae07cd6e8ff31cfe13
+gz-common 4daa84f2e7e23eed296d6b997fac88e63b0a450d
+gz-msgs 89c0c3d1474f545cb889335daf930bfdab6ab852
