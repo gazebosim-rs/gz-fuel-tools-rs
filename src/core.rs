@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
+// SPDX-License-Identifier: Apache-2.0
 //! Compatibility value semantics, configuration and Fuel JSON codecs.
 use serde_json::{Value, json};
 use std::{env, fs, path::Path};

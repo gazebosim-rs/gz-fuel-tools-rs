@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 //! Typed native Rust API. No Gazebo C++ dependencies are required.
 use serde::{Deserialize, Serialize};

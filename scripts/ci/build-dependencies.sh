@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 # Build only the pinned Gazebo libraries required by unchanged C++ parity tests.
 set -euo pipefail
 cd "$(dirname "$0")/../.."

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 """Measure all production C++ facade lines, including inline bridge helpers."""
 from pathlib import Path
 import json

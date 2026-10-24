@@ -150,3 +150,14 @@
   real Cargo. All eight Python validation tests pass; a clean snapshot containing
   the real upstream checkout produces and verifies exactly 26 native crate files,
   with list/archive agreement and no upstream paths. No --allow-dirty is used.
+
+## Copyright attribution alignment
+
+- Confirmed upstream uses Open Source Robotics Foundation as the copyright holder.
+  Retained upstream public and private declarations keep their original notices
+  and years; all public headers remain byte-for-byte identical.
+- Added matching 2026 copyright and Apache-2.0 SPDX notices to rewritten project
+  sources and supporting scripts, plus a repository-wide NOTICE and README notice.
+- Require NOTICE in the native Rust crate and install LICENSE/NOTICE with the C++
+  facade. Package tests reject missing attribution, and release checks compare
+  installed legal documents with the source archive.

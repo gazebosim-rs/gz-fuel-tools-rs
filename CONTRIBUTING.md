@@ -6,6 +6,11 @@ review. Contributions are provided under this repository's Apache-2.0 license;
 retain upstream notices and attribution. Report vulnerabilities through
 [SECURITY.md](SECURITY.md).
 
+Use `Copyright (C) YEAR Open Source Robotics Foundation` and
+`SPDX-License-Identifier: Apache-2.0` in new project source files. Preserve the
+original copyright years and notices in retained upstream files. Keep `LICENSE`
+and `NOTICE` included in source packages and native installations.
+
 ## Build and test
 
 See [README.md](README.md) for native dependencies and C++ setup, and

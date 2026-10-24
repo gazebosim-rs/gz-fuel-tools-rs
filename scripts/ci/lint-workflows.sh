@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 # GitHub's required gate is code too; lint it with a checksum-pinned tool.
 set -euo pipefail
 cd "$(dirname "$0")/../.."

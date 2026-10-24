@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 // Compatibility ownership/cursor adaptation. HTTP and metadata decoding run in Rust.
 #include <stdexcept>

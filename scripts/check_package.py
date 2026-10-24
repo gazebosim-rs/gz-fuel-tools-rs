@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 """Validate the native Rust distribution's file list and generated crate archive."""
 
 import argparse
@@ -9,7 +11,7 @@ import tomllib
 
 ROOT_FILES = frozenset({
     ".cargo_vcs_info.json", "Cargo.toml", "Cargo.toml.orig", "Cargo.lock",
-    "LICENSE", "README.md", "CHANGELOG.md", "RELEASING.md", "CONTRIBUTING.md",
+    "LICENSE", "NOTICE", "README.md", "CHANGELOG.md", "RELEASING.md", "CONTRIBUTING.md",
     "SECURITY.md",
 })
 REQUIRED_FILES = ROOT_FILES | {

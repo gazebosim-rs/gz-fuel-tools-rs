@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 //! Gazebo Fuel resource client, storage, and compatibility operations.
 pub mod api;

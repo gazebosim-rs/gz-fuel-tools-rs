@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Open Source Robotics Foundation
 // SPDX-License-Identifier: Apache-2.0
 //! Rust command-line argument adapter, shared by the standalone and gz frontends.
 use serde_json::{Value, json};

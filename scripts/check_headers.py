@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 """Compare consumer declarations against the pinned upstream source tree."""
 import os
 from pathlib import Path

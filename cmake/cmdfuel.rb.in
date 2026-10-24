@@ -1,3 +1,4 @@
+# Copyright (C) 2026 Open Source Robotics Foundation
 # SPDX-License-Identifier: Apache-2.0
 # Gazebo Tools plugin adapter. All command implementation is in Rust.
 class Cmd

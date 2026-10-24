@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Open Source Robotics Foundation
+# SPDX-License-Identifier: Apache-2.0
 """Regressions for stale versions that could produce inconsistent releases."""
 
 import importlib.util

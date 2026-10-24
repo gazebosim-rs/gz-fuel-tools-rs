@@ -1,0 +1,8 @@
+Gazebo Fuel Tools in Rust
+Copyright (C) 2026 Open Source Robotics Foundation
+
+This project includes declarations and interfaces from Gazebo gz-fuel-tools,
+Copyright Open Source Robotics Foundation. Retained upstream source files
+preserve their original copyright years and notices.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
